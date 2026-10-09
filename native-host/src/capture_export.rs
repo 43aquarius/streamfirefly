@@ -139,6 +139,7 @@ mod tests {
             directory,
             stop: true,
             worker_active: false,
+            runtime: Default::default(),
         }
     }
 

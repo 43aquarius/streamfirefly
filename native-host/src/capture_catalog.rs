@@ -121,6 +121,7 @@ pub(crate) fn load(root: &Path) -> Catalog {
                         directory,
                         stop: true,
                         worker_active: false,
+                        runtime: Default::default(),
                     })),
                 );
                 continue;

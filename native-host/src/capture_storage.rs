@@ -1,12 +1,15 @@
 use crate::capture_model::{Session, Track};
 use crate::capture_format::inspect_file;
+use crate::capture_space::free_bytes;
 use crate::persistence::replace_file;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 const MAX_CHUNK: usize = 256 * 1024;
 const MAX_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const FREE_SPACE_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) fn save(session: &Session) -> io::Result<()> {
     let target = session.directory.join("capture.json");
     let temporary = session.directory.join("capture.tmp");
@@ -118,6 +121,10 @@ pub(crate) fn append(session: &Arc<Mutex<Session>>, frame: &[u8]) -> Result<Valu
     current.snapshot.tracks[index].next_sequence += 1;
     current.snapshot.tracks[index].last_chunk_size = data.len() as u64;
     current.snapshot.bytes += data.len() as u64;
+    if current.runtime.free_checked.is_none_or(|checked| checked.elapsed() >= FREE_SPACE_INTERVAL) {
+        current.runtime.free_bytes = free_bytes(&current.directory);
+        current.runtime.free_checked = Some(Instant::now());
+    }
     if !current.snapshot.tracks[index].initialized {
         current.snapshot.tracks[index].initialized = inspect_file(&current.directory.join(&current.snapshot.tracks[index].file), mime)
             .map_err(|_| "capture_read_failed")?.initialized;

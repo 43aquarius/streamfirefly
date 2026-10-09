@@ -208,6 +208,22 @@ describe("capture page guidance and records", () => {
     await wrapper.findAll("label.feature-check").find(label => label.text().includes("H.264"))!.get("input").setValue(false); await flushPromises();
     expect(wrapper.text()).toContain("当前录到的是 AV1，Windows 自带播放器打不开。想要能直接播放的文件，请使用支持的应用程序或者请勾选“优先录制兼容格式”后重新一键捕捉。"); wrapper.unmount();
   });
+  it("shows how far the helper is with the video file and warns about low disk space", async () => {
+    const GB = 1024 ** 3;
+    let live = record("live", "capturing", 3, { tabId: 1, bytes: 2 * GB, freeBytes: 3 * GB });
+    send.mockImplementation(async message => { if (message.type === "capture.list") return { ok: true, value: [live] }; throw Error(message.type); });
+    const wrapper = mount(CapturePanel, { props: { context } }); await flushPromises();
+    const guidance = () => wrapper.get(".capture-guidance");
+    expect(guidance().text()).toContain("注意：硬盘只剩 3.0 GB，录完生成视频还需要约 2.0 GB。");
+    expect(guidance().attributes("data-tone")).toBe("warning");
+    wrapper.unmount();
+    live = record("live", "finalizing", 3, { tabId: 1, bytes: 2 * GB, merge: { segment: 1, segments: 2, processedBytes: GB, totalBytes: 2 * GB, idleSeconds: 1 } });
+    const saving = mount(CapturePanel, { props: { context } }); await flushPromises();
+    expect(saving.get(".capture-guidance").text()).toBe("正在生成视频文件（第 1/2 段）：已处理 1.0 GB / 2.0 GB，约 50%。文件越大需要越久，请保持浏览器打开。");
+    expect(saving.get(".capture-guidance").attributes("data-tone")).toBeUndefined();
+    expect(saving.get(".capture-session-meta").text()).toContain("2.0 GB · 已生成约 50%");
+    saving.unmount();
+  });
   it("marks records that are still recording or generating the file as busy", async () => {
     send.mockImplementation(async message => { if (message.type === "capture.list") return { ok: true, value: [record("recording", "capturing", 3), record("saving", "finalizing", 2), record("done", "complete", 1)] }; throw Error(message.type); });
     const wrapper = mount(CapturePanel, { props: { context } }); await flushPromises();

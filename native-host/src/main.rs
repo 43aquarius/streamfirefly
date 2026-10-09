@@ -7,6 +7,7 @@ mod capture_output;
 mod capture_merge;
 mod capture_model;
 mod capture_socket;
+mod capture_space;
 mod capture_storage;
 mod dash;
 mod dash_download;

@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import type { CaptureSnapshot } from "../../../../shared/capture";
-import { folderOf } from "../../format";
+import { folderOf, formatBytes } from "../../format";
 import { sessionError, sessionRequest } from "../session-client";
-import { CAPTURE_STATE_LABELS, captureTitle, codecHint, isFinishedCapture } from "./display";
+import { CAPTURE_STATE_LABELS, captureTitle, codecHint, isFinishedCapture, mergePercent } from "./display";
 import SfIcon from "../../ui/SfIcon.vue";
 import SfDialog from "../../ui/SfDialog.vue";
 
@@ -33,7 +33,7 @@ function confirmCleanup() { pendingCleanup.value = false; emit("removeFailed"); 
   <header v-if="heading && sessions.length" class="capture-records-head"><h4>录制记录 <small>{{ sessions.length }} 条，最新的在上</small></h4><button v-if="failedSessions.length" class="button sm" :disabled="busy" @click="pendingCleanup = true"><SfIcon name="trash" /><span>清理失败记录</span></button></header>
   <p v-if="notice" class="feature-message" role="status">{{ notice }}</p>
   <article v-for="session in sessions" :key="session.id" class="feature-rule capture-session" :class="{ latest: session.id === latestId, busy: ['capturing', 'finalizing'].includes(session.state) }">
-    <div class="dispatch-item-head"><span class="dispatch-state" :data-state="session.state">{{ CAPTURE_STATE_LABELS[session.state] || session.state }}</span><strong class="capture-session-title" :title="session.pageUrl || session.source?.url">{{ captureTitle(session) }}</strong><small class="capture-session-meta">{{ when(session) }}<template v-if="session.state !== 'unavailable'"> · {{ (session.bytes / 1048576).toFixed(1) }} MiB</template></small></div>
+    <div class="dispatch-item-head"><span class="dispatch-state" :data-state="session.state">{{ CAPTURE_STATE_LABELS[session.state] || session.state }}</span><strong class="capture-session-title" :title="session.pageUrl || session.source?.url">{{ captureTitle(session) }}</strong><small class="capture-session-meta">{{ when(session) }}<template v-if="session.state !== 'unavailable'"> · {{ formatBytes(session.bytes) }}</template><template v-if="session.state === 'finalizing' && session.merge"> · 已生成约 {{ mergePercent(session) }}%</template></small></div>
     <p v-if="session.ended && session.state === 'complete'" class="feature-note">视频已播放到结尾。</p>
     <div v-for="output in session.outputs" :key="output" class="capture-output-row"><p class="capture-output">{{ output }}</p><button class="button sm" type="button" @click="copyFolder(output)"><SfIcon name="copy" /><span>复制文件夹路径</span></button><button class="button sm" type="button" @click="revealOutput(session, output)"><SfIcon name="folder" /><span>打开文件夹</span></button></div>
     <p v-if="session.outputs.length" class="feature-note">{{ codecHint(session) }}</p>

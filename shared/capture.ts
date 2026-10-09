@@ -33,6 +33,10 @@ export interface CaptureSnapshot {
   createdAt?: number;
   pageTitle?: string;
   pageUrl?: string;
+  /** Progress of the segment the helper is merging into a video file; only present while it runs. */
+  merge?: { segment: number; segments: number; processedBytes: number; totalBytes: number; idleSeconds: number };
+  /** Free space on the volume holding the recording, refreshed by the helper while it writes. */
+  freeBytes?: number;
 }
 export interface DeepSearchStatus {
   enabled: boolean;

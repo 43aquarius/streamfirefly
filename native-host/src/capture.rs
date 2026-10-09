@@ -112,6 +112,7 @@ impl CaptureManager {
             directory,
             stop: false,
             worker_active: true,
+            runtime: Default::default(),
         }));
         {
             let current = session.lock().map_err(|_| "capture_unavailable")?;
@@ -211,10 +212,26 @@ impl CaptureManager {
         let sessions = self.sessions.lock().unwrap();
         let mut snapshots = sessions
             .values()
-            .filter_map(|session| session.lock().ok().map(|value| value.snapshot.clone()))
+            .filter_map(|session| {
+                session.lock().ok().map(|value| {
+                    (value.snapshot.clone(), value.runtime.merge.clone(), value.runtime.free_bytes)
+                })
+            })
             .collect::<Vec<_>>();
-        snapshots.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
-        let mut entries = snapshots.iter().map(|snapshot| json!(snapshot)).collect::<Vec<_>>();
+        snapshots.sort_by(|(a, ..), (b, ..)| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+        let mut entries = snapshots
+            .into_iter()
+            .map(|(snapshot, merge, free_bytes)| {
+                let mut entry = json!(snapshot);
+                if let Some(merge) = merge {
+                    entry["merge"] = json!(merge);
+                }
+                if let Some(free_bytes) = free_bytes {
+                    entry["freeBytes"] = json!(free_bytes);
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
         entries.extend(self.errors.clone());
         json!(entries)
     }
@@ -556,7 +573,19 @@ mod tests {
         assert_eq!(listed[0]["id"], newer);
         assert_eq!(listed[1]["id"], older);
         assert_eq!(listed[0]["pageTitle"], "页面");
+        assert!(listed[0].get("merge").is_none() && listed[0].get("freeBytes").is_none());
         let newer_session = manager.sessions.lock().unwrap()[&newer].clone();
+        {
+            let mut current = newer_session.lock().unwrap();
+            current.runtime.free_bytes = Some(4096);
+            current.runtime.merge = Some(crate::capture_model::MergeProgress { segment: 1, segments: 2, processed_bytes: 10, total_bytes: 40, idle_seconds: 3 });
+            save(&current).unwrap();
+        }
+        let listed = manager.list();
+        assert_eq!(listed[0]["freeBytes"], 4096);
+        assert_eq!(listed[0]["merge"], json!({"segment":1,"segments":2,"processedBytes":10,"totalBytes":40,"idleSeconds":3}));
+        let saved: Value = serde_json::from_slice(&fs::read(newer_directory.join("capture.json")).unwrap()).unwrap();
+        assert!(saved.get("merge").is_none() && saved.get("freeBytes").is_none());
         newer_session.lock().unwrap().snapshot.outputs = vec![exported.to_string_lossy().into_owned()];
         manager.delete(&json!({"id":older})).unwrap();
         assert!(!older_directory.exists());
@@ -634,6 +663,7 @@ mod tests {
                 directory,
                 stop: false,
                 worker_active: false,
+                runtime: Default::default(),
                 snapshot: Snapshot {
                     version: 1,
                     id: id.clone(),
@@ -742,6 +772,7 @@ mod tests {
             directory: directory.clone(),
             stop: false,
             worker_active: false,
+            runtime: Default::default(),
             snapshot: Snapshot {
                 version: 1,
                 id: "test".into(),

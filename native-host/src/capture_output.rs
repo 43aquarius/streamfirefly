@@ -92,13 +92,19 @@ pub(crate) fn matches(path: &Path, expected: &[u64]) -> bool {
     let mut expected = expected.to_vec(); expected.sort_unstable();
     stream_types(path).is_ok_and(|actual| actual == expected)
 }
-pub(crate) fn read_progress(mut input: impl Read) -> io::Result<u64> {
-    let mut buffer = [0; 4096]; let mut line = Vec::new(); let mut discard = false; let mut time = 0;
+/// Returns the final `out_time_us`; `advanced` receives the bytes written whenever the size or the time grows.
+pub(crate) fn read_progress(mut input: impl Read, mut advanced: impl FnMut(u64)) -> io::Result<u64> {
+    let mut buffer = [0; 4096]; let mut line = Vec::new(); let mut discard = false; let mut time = 0; let mut size = 0;
     loop {
         let count = input.read(&mut buffer)?; if count == 0 { break; }
         for byte in &buffer[..count] {
             if *byte == b'\n' {
-                if !discard { if let Ok(text) = std::str::from_utf8(&line) { if let Some(value) = text.trim_end().strip_prefix("out_time_us=").and_then(|value| value.parse::<u64>().ok()) { time = time.max(value); } } }
+                if !discard { if let Ok(text) = std::str::from_utf8(&line) {
+                    let text = text.trim_end();
+                    let value = |key: &str| text.strip_prefix(key).and_then(|value| value.parse::<u64>().ok());
+                    if let Some(value) = value("out_time_us=").filter(|value| *value > time) { time = value; advanced(size); }
+                    if let Some(value) = value("total_size=").filter(|value| *value > size) { size = value; advanced(size); }
+                } }
                 line.clear(); discard = false;
             } else if line.len() < 256 { line.push(*byte); } else { discard = true; }
         }
@@ -114,9 +120,19 @@ mod tests {
     fn element(id: &[u8], body: &[u8]) -> Vec<u8> { assert!(body.len() < 127); [id, &[128 | body.len() as u8], body].concat() }
     #[test]
     fn progress_requires_positive_microseconds_and_is_bounded() {
-        assert_eq!(read_progress(Cursor::new(b"out_time_us=0\nout_time_ms=999\nprogress=end\n")).unwrap(), 0);
-        assert_eq!(read_progress(Cursor::new(b"out_time_us=N/A\nout_time_us=-1\nout_time_us=1234\nout_time_us=1\n")).unwrap(), 1234);
-        assert_eq!(read_progress(Cursor::new([vec![b'x'; 10000], b"\nout_time_us=12\n".to_vec()].concat())).unwrap(), 12);
+        assert_eq!(read_progress(Cursor::new(b"out_time_us=0\nout_time_ms=999\nprogress=end\n"), |_| {}).unwrap(), 0);
+        assert_eq!(read_progress(Cursor::new(b"out_time_us=N/A\nout_time_us=-1\nout_time_us=1234\nout_time_us=1\n"), |_| {}).unwrap(), 1234);
+        assert_eq!(read_progress(Cursor::new([vec![b'x'; 10000], b"\nout_time_us=12\n".to_vec()].concat()), |_| {}).unwrap(), 12);
+    }
+    #[test]
+    fn progress_reports_only_growth_in_size_or_time() {
+        let mut reports = Vec::new();
+        let input = b"total_size=N/A\nout_time_us=0\ntotal_size=4096\nout_time_us=500\ntotal_size=4096\nout_time_us=500\nprogress=continue\ntotal_size=8192\nout_time_us=500\n";
+        assert_eq!(read_progress(Cursor::new(input), |size| reports.push(size)).unwrap(), 500);
+        assert_eq!(reports, [4096, 4096, 8192]);
+        reports.clear();
+        read_progress(Cursor::new([b"total_size=1".to_vec(), vec![b'0'; 300], b"\n".to_vec()].concat()), |size| reports.push(size)).unwrap();
+        assert!(reports.is_empty());
     }
     #[test]
     fn container_requires_complete_tracks_with_matching_types() {
