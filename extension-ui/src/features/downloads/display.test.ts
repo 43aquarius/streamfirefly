@@ -38,4 +38,11 @@ describe("download task display", () => {
     expect(stateIcon(task({ live_recording: true }))).toBe("broadcast");
     expect(stateIcon(task({ state: "succeeded" }))).toBe("circle-check");
   });
+
+  it("keeps the output collision recovery instruction visible for failed and partial tasks", () => {
+    const message = "输出文件已存在或被其他任务占用，请保留原文件并新建任务。";
+    for (const state of ["failed", "partial"] as const) {
+      expect(statusLine(task({ state, error: "output_path_conflict", message }))).toContain(message);
+    }
+  });
 });

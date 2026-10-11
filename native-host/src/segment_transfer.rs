@@ -1,6 +1,6 @@
 use crate::http_download::add_request_args;
 use crate::model::Task;
-use crate::processes::{cancel_requested, register_process, unregister_process};
+use crate::processes::{cancel_requested, spawn_process, unregister_process};
 use crate::runtime::TaskRuntime;
 use crate::segments::ByteRange;
 use std::{
@@ -71,14 +71,13 @@ pub(crate) fn curl_once(
     }
     add_request_args(&mut args, task, url);
     args.push(url.into());
-    let mut child = Command::new("curl")
+    let child = spawn_process(store, &task.id, Command::new("curl")
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
+    )
         .map_err(|error| error.to_string())?;
-    let mut stdout = child.stdout.take();
-    let child = register_process(store, &task.id, child);
+    let mut stdout = child.lock().map_err(|_| "process_lock_poisoned")?.stdout.take();
     loop {
         if abort.load(Ordering::Relaxed) || cancel_requested(store, &task.id) {
             if let Ok(mut process) = child.lock() {

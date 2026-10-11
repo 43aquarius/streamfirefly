@@ -461,6 +461,19 @@ pub(crate) fn publish_task_output(
     tasks: &[Task],
     self_task_id: &str,
 ) -> Result<(), &'static str> {
+    publish_task_output_with(temporary, destination, tasks, self_task_id, |source, destination| {
+        std::io::copy(source, destination)?;
+        destination.sync_all()
+    })
+}
+
+fn publish_task_output_with(
+    temporary: &Path,
+    destination: &Path,
+    tasks: &[Task],
+    self_task_id: &str,
+    write_output: impl FnOnce(&mut fs::File, &mut fs::File) -> std::io::Result<()>,
+) -> Result<(), &'static str> {
     let occupied = tasks.iter().any(|task| {
         task.id != self_task_id
             && (task
@@ -482,29 +495,52 @@ pub(crate) fn publish_task_output(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|_| "path_not_writable")?;
     }
+    let mut source = fs::File::open(temporary).map_err(|_| "output_write_failed")?;
     let mut created = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(destination)
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::AlreadyExists => "output_path_conflict",
-            _ => "path_not_writable",
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists || destination.exists() {
+                "output_path_conflict"
+            } else { "path_not_writable" }
         })?;
-    let mut source = fs::File::open(temporary).map_err(|_| "output_write_failed")?;
-    if let Err(error) = std::io::copy(&mut source, &mut created) {
-        drop(created);
-        let _ = fs::remove_file(destination);
-        return Err(match error.kind() {
-            std::io::ErrorKind::AlreadyExists => "output_path_conflict",
-            _ => "output_write_failed",
-        });
-    }
-    if created.sync_all().is_err() {
+    if write_output(&mut source, &mut created).is_err() {
         drop(created);
         let _ = fs::remove_file(destination);
         return Err("output_write_failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn failed_copy_or_sync_removes_only_the_created_output() {
+        let dir = std::env::temp_dir().join(format!("streamfirefly-publish-failure-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("media.tmp");
+        fs::write(&source, b"complete-media").unwrap();
+        for partial in [true, false] {
+            let destination = dir.join("media.mkv");
+            let result = publish_task_output_with(&source, &destination, &[], "self", |input, output| {
+                if partial { output.write_all(b"partial")?; }
+                else { std::io::copy(input, output)?; }
+                Err(std::io::Error::other(if partial { "injected copy failure" } else { "injected sync failure" }))
+            });
+            assert_eq!(result, Err("output_write_failed"));
+            assert!(!destination.exists());
+            assert_eq!(fs::read(&source).unwrap(), b"complete-media");
+        }
+        let destination = dir.join("existing.mkv");
+        fs::write(&destination, b"original").unwrap();
+        assert_eq!(publish_task_output_with(&source, &destination, &[], "self", |_, _| panic!("must not write occupied output")), Err("output_path_conflict"));
+        assert_eq!(fs::read(destination).unwrap(), b"original");
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 pub(crate) fn validate_dir(value: &str) -> Result<PathBuf, &'static str> {

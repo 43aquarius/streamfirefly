@@ -1,6 +1,6 @@
 use crate::model::Task;
 use crate::processes::cancel_requested;
-use crate::processes::register_process;
+use crate::processes::spawn_process;
 use crate::processes::unregister_process;
 use crate::runtime::TaskRuntime;
 use crate::task_state::update;
@@ -54,17 +54,17 @@ pub(crate) fn run_ffmpeg_with_progress(
     progress_span: u8,
     message: &str,
 ) -> Result<(), String> {
-    let mut child = Command::new(bundled_tool("ffmpeg.exe"))
+    let child = spawn_process(store, &task.id, Command::new(bundled_tool("ffmpeg.exe"))
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
+    )
         .map_err(|error| error.to_string())?;
     let stdout = child
+        .lock().map_err(|_| "process_lock_poisoned")?
         .stdout
         .take()
         .ok_or_else(|| "ffmpeg_progress_unavailable".to_string())?;
-    let child = register_process(store, &task.id, child);
     let position = Arc::new(Mutex::new(0.0_f64));
     let reader_position = position.clone();
     thread::spawn(move || {

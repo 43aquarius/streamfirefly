@@ -445,6 +445,17 @@ mod tests {
     use super::*;
     use crate::capture_storage::append;
     #[test]
+    fn shutdown_is_idempotent_and_reports_worker_failure() {
+        let root = std::env::temp_dir().join(format!("capture-shutdown-{}", Uuid::new_v4()));
+        let manager = CaptureManager::new(root.clone());
+        manager.open(&json!({"origin":"chrome-extension://abcdefghijklmnopabcdefghijklmnop"})).unwrap();
+        manager.shutdown().unwrap();
+        manager.shutdown().unwrap();
+        manager.workers.lock().unwrap().push(thread::spawn(|| panic!("controlled worker failure")));
+        assert!(manager.shutdown().unwrap_err().contains("capture_worker_panicked"));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn rejects_untrusted_origins_before_creating_files() {
         let root = std::env::temp_dir().join(format!("capture-test-{}", Uuid::new_v4()));
         let manager = CaptureManager::new(root.clone());

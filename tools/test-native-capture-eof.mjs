@@ -49,8 +49,11 @@ function startHost(temporary) {
 async function eofExit(child) {
   const exited = once(child, 'exit');
   child.stdin.end();
-  const [code] = await exited;
-  return code;
+  let timer;
+  try {
+    const [code] = await Promise.race([exited, new Promise((_, reject) => { timer = setTimeout(() => { child.kill(); reject(Error('Host EOF cleanup exceeded 15 seconds')); }, 15000); })]);
+    return code;
+  } finally { clearTimeout(timer); }
 }
 
 function sessionDir(temporary, id) {
@@ -176,7 +179,7 @@ try {
     while (Date.now() < deadline) {
       if (fs.existsSync(diagnosticsPath)) {
         const diagnostics = JSON.parse(fs.readFileSync(diagnosticsPath, 'utf8'));
-        mergePids = diagnostics.filter(event => event.stage === 'merge-started').map(event => event.details.pid).filter(Boolean);
+        mergePids = diagnostics.filter(event => event.stage === 'merge-started').map(event => event.details.pid).filter(pid => pid && processAlive(pid));
         if (mergePids.length > 0) break;
       }
       await new Promise(resolve => setTimeout(resolve, 20));
@@ -202,6 +205,17 @@ try {
     const host = startHost(temporary);
     await host.send('host.info');
     assert.equal(await eofExit(host.child), 0, 'idle host must still exit 0');
+  }
+
+  // A directory at the temporary checkpoint path forces a real save failure.
+  {
+    const host = startHost(temporary);
+    let stderr = '';
+    host.child.stderr.on('data', bytes => { stderr += bytes.toString(); });
+    const { id } = await openSession(host, temporary);
+    fs.mkdirSync(path.join(sessionDir(temporary, id), 'capture.tmp'));
+    assert.equal(await eofExit(host.child), 1, 'failed checkpoint save must exit nonzero');
+    assert.match(stderr, /capture_checkpoint_failed/);
   }
 
   console.log('Native capture EOF shutdown: completed preserved, armed/capturing/finalizing interrupted, merge FFmpeg reaped passed');

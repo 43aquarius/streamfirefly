@@ -912,3 +912,17 @@ fn publish_retry_after_conflict_succeeds_once_destination_is_free() {
     assert_eq!(fs::read(&destination).unwrap(), b"new-media-bytes");
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn publish_missing_source_does_not_reserve_the_destination() {
+    let dir = std::env::temp_dir().join(format!("streamfirefly-publish-source-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let destination = dir.join("movie.mkv");
+    let temporary = dir.join("missing.tmp");
+    assert_eq!(crate::task_input::publish_task_output(&temporary, &destination, &[], "self"), Err("output_write_failed"));
+    assert!(!destination.exists(), "failed source open left an empty final output");
+    fs::write(&temporary, b"complete-media").unwrap();
+    assert_eq!(crate::task_input::publish_task_output(&temporary, &destination, &[], "self"), Ok(()));
+    assert_eq!(fs::read(&destination).unwrap(), b"complete-media");
+    fs::remove_dir_all(dir).unwrap();
+}

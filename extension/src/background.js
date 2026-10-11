@@ -194,30 +194,39 @@ function seedDownloadBadge() {
 // change re-configures, and a disconnect resets everything so the next connection starts over.
 let nativeInitPromise = null;
 let configuredNetwork = null;
+let nativeInitGeneration = 0;
 function resetNativeInit() {
+  nativeInitGeneration += 1;
   nativeInitPromise = null;
   configuredNetwork = null;
   downloadBadgeSeeded = false;
 }
 async function ensureNativeConfigured() {
   await settings.ready;
-  const current = settings.get();
-  const wanted = { mode: current.proxyMode, proxyUrl: current.proxyUrl };
-  if (configuredNetwork && (configuredNetwork.mode !== wanted.mode || configuredNetwork.proxyUrl !== wanted.proxyUrl)) nativeInitPromise = null;
   if (nativeInitPromise) return nativeInitPromise;
+  const generation = nativeInitGeneration;
   const initialization = (async () => {
     const info = await nativeInfo();
     if (!info.ok) return info;
-    const configured = await nativeRequestPromise("network.configure", wanted);
-    if (!configured?.ok) return configured;
-    configuredNetwork = wanted;
-    seedDownloadBadge();
-    return info;
+    while (generation === nativeInitGeneration) {
+      const current = settings.get();
+      const wanted = { mode: current.proxyMode, proxyUrl: current.proxyUrl };
+      if (configuredNetwork?.mode !== wanted.mode || configuredNetwork?.proxyUrl !== wanted.proxyUrl) {
+        const configured = await nativeRequestPromise("network.configure", wanted);
+        if (generation !== nativeInitGeneration) break;
+        if (!configured?.ok) return configured;
+        configuredNetwork = wanted;
+        const latest = settings.get();
+        if (latest.proxyMode !== wanted.mode || latest.proxyUrl !== wanted.proxyUrl) continue;
+      }
+      seedDownloadBadge();
+      return info;
+    }
+    return { ok: false, error: "native_host_disconnected" };
   })();
   nativeInitPromise = initialization;
-  const result = await initialization;
-  if (!result.ok && nativeInitPromise === initialization) nativeInitPromise = null;
-  return result;
+  try { return await initialization; }
+  finally { if (nativeInitPromise === initialization) nativeInitPromise = null; }
 }
 
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {

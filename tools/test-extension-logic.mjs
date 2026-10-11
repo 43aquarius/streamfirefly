@@ -25,6 +25,8 @@ const sidePanelCalls = [];
 let rejectSidePanelOpen = false, rejectSidePanelClose = false;
 let nativeInfoError = null;
 let nativeConfigureError = null;
+let deferNativeConfigure = false;
+const deferredNativeConfigure = [];
 let nativeSilent = false;
 let nextTabId = 100;
 const tabsById = new Map([
@@ -71,6 +73,7 @@ const api = {
       onDisconnect: { addListener: listener => { nativeListeners.disconnect = listener; } },
       postMessage: message => {
         nativePosted.push(structuredClone(message));
+        if (message.type === 'network.configure' && deferNativeConfigure) { deferredNativeConfigure.push(message); return; }
         if (nativeSilent) return;
         queueMicrotask(() => {
           if (nativeInfoError && message.type === 'host.info') { nativeListeners.message({ id: message.id, ok: false, error: nativeInfoError }); return; }
@@ -130,6 +133,47 @@ if (initOrder.join(',') !== 'host.info,network.configure,task.list') throw new E
 const postedAfterFirstInit = nativePosted.length;
 await Promise.all([send({ type: 'native.connect' }), send({ type: 'native.connect' }), send({ type: 'native.connect' })]);
 if (nativePosted.length !== postedAfterFirstInit) throw new Error('Concurrent native initialization repeated network.configure or task.list');
+nativeListeners.disconnect();
+await settle();
+deferNativeConfigure = true;
+const initialPolicy = send({ type: 'native.connect' });
+await flush();
+if (deferredNativeConfigure.length !== 1) throw new Error('Network configuration was not suspended');
+listeners.storageChanged({ proxyMode: { newValue: 'custom' }, proxyUrl: { newValue: 'http://127.0.0.1:7897' } }, 'local');
+const newPolicyTask = send({ type: 'task.create', payload: { url: 'https://media.example/clip.mp4', fileName: 'policy-race', mime: 'video/mp4' } });
+await flush();
+deferNativeConfigure = false;
+for (const message of deferredNativeConfigure.splice(0)) nativeListeners.message({ id: message.id, ok: true });
+await initialPolicy;
+await newPolicyTask;
+const policyTraffic = nativePosted.slice(postedAfterFirstInit);
+const lastPolicy = policyTraffic.filter(message => message.type === 'network.configure').at(-1);
+if (lastPolicy?.payload.mode !== 'custom' || lastPolicy.payload.proxyUrl !== 'http://127.0.0.1:7897') throw new Error('A task was released under the stale policy while initialization was pending');
+if (policyTraffic.findIndex(message => message.type === 'task.create') < policyTraffic.lastIndexOf(lastPolicy)) throw new Error('A task started before the latest proxy policy was configured');
+listeners.storageChanged({ proxyMode: { newValue: 'direct' }, proxyUrl: { newValue: '' } }, 'local');
+deferNativeConfigure = true;
+const reconfiguration = send({ type: 'native.connect' });
+await flush();
+listeners.storageChanged({ proxyMode: { newValue: 'custom' }, proxyUrl: { newValue: 'http://127.0.0.1:7898' } }, 'local');
+const latestPolicy = send({ type: 'native.connect' });
+await flush();
+deferNativeConfigure = false;
+for (const message of deferredNativeConfigure.splice(0)) nativeListeners.message({ id: message.id, ok: true });
+await Promise.all([reconfiguration, latestPolicy]);
+if (nativePosted.filter(message => message.type === 'network.configure').at(-1)?.payload.proxyUrl !== 'http://127.0.0.1:7898') throw new Error('Reconfiguration did not converge to the latest network policy');
+listeners.storageChanged({ proxyMode: { newValue: 'system' }, proxyUrl: { newValue: '' } }, 'local');
+deferNativeConfigure = true;
+const disconnectedConfigure = send({ type: 'native.connect' });
+await flush();
+const staleConfigure = deferredNativeConfigure.splice(0);
+nativeListeners.disconnect();
+if ((await disconnectedConfigure).ok) throw new Error('Disconnected configuration was reported ready');
+deferNativeConfigure = false;
+await send({ type: 'native.connect' });
+const afterReconnect = nativePosted.length;
+for (const message of staleConfigure) nativeListeners.message({ id: message.id, ok: true });
+await send({ type: 'native.connect' });
+if (nativePosted.length !== afterReconnect) throw new Error('Stale configuration response invalidated the new connection');
 nativeListeners.disconnect();
 await settle();
 const postedAfterDisconnect = nativePosted.length;

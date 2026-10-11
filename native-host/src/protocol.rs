@@ -5,7 +5,6 @@ use crate::repository::sanitized_task;
 use crate::repository::sanitized_tasks;
 use crate::repository::save_store;
 use crate::runtime::load_store;
-use crate::processes::stop_process;
 use crate::runtime::TaskRuntime;
 use crate::scheduler::start_download;
 use crate::task_control::delete_task;
@@ -172,22 +171,13 @@ pub(crate) fn run() -> io::Result<()> {
 
 /// Ends every download child before the host exits so no orphaned writer outlives it.
 /// Holding the task list blocks runner updates, so persisted states stay resumable on the next start.
-fn shutdown_downloads(store: &TaskRuntime) {
+fn shutdown_downloads(store: &TaskRuntime) -> Result<(), String> {
     let _tasks = store
         .repository
         .tasks
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let ids: Vec<String> = store
-        .processes
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .keys()
-        .cloned()
-        .collect();
-    for id in ids {
-        stop_process(store, &id);
-    }
+    crate::processes::shutdown_processes(store)
 }
 
 /// Normal EOF shutdown: freeze task scheduling and retries first, end the download
@@ -195,12 +185,12 @@ fn shutdown_downloads(store: &TaskRuntime) {
 /// exits non-zero instead of pretending success.
 fn shutdown_host(store: &TaskRuntime, captures: &crate::capture::CaptureManager) -> ! {
     store.exiting.store(true, std::sync::atomic::Ordering::SeqCst);
-    shutdown_downloads(store);
+    let download_result = shutdown_downloads(store);
     let capture_result = captures.shutdown();
-    match capture_result {
-        Ok(()) => std::process::exit(0),
-        Err(error) => {
-            eprintln!("streamfirefly capture shutdown incomplete: {error}");
+    match (download_result, capture_result) {
+        (Ok(()), Ok(())) => std::process::exit(0),
+        (download, capture) => {
+            eprintln!("streamfirefly shutdown incomplete: download={download:?}, capture={capture:?}");
             std::process::exit(1)
         }
     }
