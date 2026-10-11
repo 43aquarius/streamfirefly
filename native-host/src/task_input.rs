@@ -455,6 +455,7 @@ pub(crate) fn unique_output_path_with(
 /// Copies a finished work file onto its final output path. The destination is created
 /// exclusively so a file that appeared after task creation is never overwritten; a
 /// partial file from a failed copy is removed again because this call created it.
+#[cfg(test)]
 pub(crate) fn publish_task_output(
     temporary: &Path,
     destination: &Path,
@@ -467,13 +468,57 @@ pub(crate) fn publish_task_output(
     })
 }
 
-fn publish_task_output_with(
+#[cfg(test)]
+pub(crate) fn publish_task_output_with(
     temporary: &Path,
     destination: &Path,
     tasks: &[Task],
     self_task_id: &str,
     write_output: impl FnOnce(&mut fs::File, &mut fs::File) -> std::io::Result<()>,
 ) -> Result<(), &'static str> {
+    let mut pending = reserve_task_output(temporary, destination, tasks, self_task_id)?;
+    if pending.write_with(write_output).is_err() {
+        let _ = pending.discard();
+        return Err("output_write_failed");
+    }
+    pending.commit();
+    Ok(())
+}
+
+pub(crate) struct PendingTaskOutput {
+    source: fs::File,
+    created: Option<fs::File>,
+    path: PathBuf,
+    committed: bool,
+}
+
+impl PendingTaskOutput {
+    pub(crate) fn write_with(&mut self, write: impl FnOnce(&mut fs::File, &mut fs::File) -> std::io::Result<()>) -> std::io::Result<()> {
+        write(&mut self.source, self.created.as_mut().expect("output reservation is active"))
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+
+    pub(crate) fn discard(&mut self) -> std::io::Result<()> {
+        drop(self.created.take());
+        fs::remove_file(&self.path)
+    }
+}
+
+impl Drop for PendingTaskOutput {
+    fn drop(&mut self) {
+        if !self.committed && self.created.is_some() { let _ = self.discard(); }
+    }
+}
+
+pub(crate) fn reserve_task_output(
+    temporary: &Path,
+    destination: &Path,
+    tasks: &[Task],
+    self_task_id: &str,
+) -> Result<PendingTaskOutput, &'static str> {
     let occupied = tasks.iter().any(|task| {
         task.id != self_task_id
             && (task
@@ -495,28 +540,48 @@ fn publish_task_output_with(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|_| "path_not_writable")?;
     }
-    let mut source = fs::File::open(temporary).map_err(|_| "output_write_failed")?;
-    let mut created = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let source = fs::File::open(temporary).map_err(|_| "output_write_failed")?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Keep the path bound to this file until its durable ownership is committed.
+        options.share_mode(0x00000001);
+    }
+    let created = options
         .open(destination)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists || destination.exists() {
                 "output_path_conflict"
             } else { "path_not_writable" }
         })?;
-    if write_output(&mut source, &mut created).is_err() {
-        drop(created);
-        let _ = fs::remove_file(destination);
-        return Err("output_write_failed");
-    }
-    Ok(())
+    Ok(PendingTaskOutput { source, created: Some(created), path: destination.to_path_buf(), committed: false })
 }
 
 #[cfg(test)]
 mod publication_tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_output_cannot_be_replaced_before_commit() {
+        let dir = std::env::temp_dir().join(format!("streamfirefly-output-ownership-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("media.tmp");
+        let destination = dir.join("movie.mkv");
+        let renamed = dir.join("renamed.mkv");
+        fs::write(&source, b"complete-media").unwrap();
+        let mut pending = reserve_task_output(&source, &destination, &[], "self").unwrap();
+        assert!(fs::rename(&destination, &renamed).is_err());
+        assert!(OpenOptions::new().write(true).open(&destination).is_err());
+        pending.write_with(|source, output| { std::io::copy(source, output)?; output.sync_all() }).unwrap();
+        pending.commit();
+        fs::rename(destination, &renamed).unwrap();
+        assert_eq!(fs::read(renamed).unwrap(), b"complete-media");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn failed_copy_or_sync_removes_only_the_created_output() {

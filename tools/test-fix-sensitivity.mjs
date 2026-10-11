@@ -21,11 +21,13 @@ const run = (command, args) => {
   return { code: result.status, output: result.stdout + result.stderr };
 };
 const cargo = ['cargo', ['test', '--manifest-path', 'native-host/Cargo.toml']];
-const sourceOpen = '    let mut source = fs::File::open(temporary).map_err(|_| "output_write_failed")?;';
+const sourceOpen = '    let source = fs::File::open(temporary).map_err(|_| "output_write_failed")?;';
 const mutants = [
   { name: 'shutdown spawn gate', file: 'native-host/src/processes.rs', mutate: text => replaceOnce(text, 'if host_exiting(store) {', 'if false {'), command: [cargo[0], [...cargo[1], 'shutdown_reaps_children_and_rejects_late_spawn']], failure: /spawn was accepted after shutdown/ },
   { name: 'latest network policy', file: 'extension/src/background.js', mutate: text => replaceOnce(text, 'if (latest.proxyMode !== wanted.mode || latest.proxyUrl !== wanted.proxyUrl) continue;', 'if (false) continue;'), command: ['node', ['tools/test-extension-logic.mjs']], failure: /stale policy while initialization was pending/ },
-  { name: 'source before destination', file: 'native-host/src/task_input.rs', mutate: text => replaceOnce(replaceOnce(text, sourceOpen, ''), '    if write_output(&mut source, &mut created).is_err() {', `${sourceOpen}\n    if write_output(&mut source, &mut created).is_err() {`), command: [cargo[0], [...cargo[1], 'publish_missing_source_does_not_reserve_the_destination']], failure: /failed source open left an empty final output/ }
+  { name: 'source before destination', file: 'native-host/src/task_input.rs', mutate: text => replaceOnce(replaceOnce(text, sourceOpen, ''), '    Ok(PendingTaskOutput { source, created:', `${sourceOpen}\n    Ok(PendingTaskOutput { source, created:`), command: [cargo[0], [...cargo[1], 'publish_missing_source_does_not_reserve_the_destination']], failure: /failed source open left an empty final output/ },
+  { name: 'EOF publication wait', file: 'native-host/src/protocol.rs', mutate: text => replaceOnce(text, 'let publication = wait_for_publications(store);', 'let publication = Ok(());'), command: [cargo[0], [...cargo[1], 'eof_waits_for_copy_and_persists_completion_before_checkpoint_cleanup']], failure: /EOF returned before the active publication settled/ },
+  { name: 'bulk copy outside task map', file: 'native-host/src/hls_publication.rs', mutate: text => replaceOnce(text, 'let copy_result = pending.write_with(write);', 'let copy_result = { let _tasks = self.store.repository.tasks.lock().unwrap(); pending.write_with(write) };'), command: [cargo[0], [...cargo[1], 'publication_does_not_hold_the_task_map_during_copy']], failure: /bulk copy held the global task map/ }
 ];
 for (const mutant of mutants) {
   const file = path.join(root, mutant.file);
@@ -49,4 +51,4 @@ for (const command of [cargo, ['node', ['tools/test-extension-logic.mjs']], ['ca
   const result = run(...command);
   assert.equal(result.code, 0, result.output);
 }
-console.log('Three deliberate regressions detected; original source and clean checks restored');
+console.log(`${mutants.length} deliberate regressions detected; original source and clean checks restored`);

@@ -169,15 +169,18 @@ pub(crate) fn run() -> io::Result<()> {
     shutdown_host(&store, &captures)
 }
 
-/// Ends every download child before the host exits so no orphaned writer outlives it.
-/// Holding the task list blocks runner updates, so persisted states stay resumable on the next start.
-fn shutdown_downloads(store: &TaskRuntime) -> Result<(), String> {
-    let _tasks = store
-        .repository
-        .tasks
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    crate::processes::shutdown_processes(store)
+/// Reaps children, then lets existing publishers finish durable output ownership.
+pub(crate) fn shutdown_downloads(store: &TaskRuntime) -> Result<(), String> {
+    let children = crate::processes::shutdown_processes(store);
+    let publication = wait_for_publications(store);
+    children.and(publication)
+}
+
+fn wait_for_publications(store: &TaskRuntime) -> Result<(), String> {
+    let _publishers = store.publications.write().map_err(|_| "publication_unavailable")?;
+    if store.publication_failed.load(std::sync::atomic::Ordering::Relaxed) {
+        Err("publication_cleanup_failed".into())
+    } else { Ok(()) }
 }
 
 /// Normal EOF shutdown: freeze task scheduling and retries first, end the download
