@@ -1070,7 +1070,7 @@ fn hls_checkpoint_round(
             let _ = publication.finish(&work_dir);
             clear_stop(&store, &task.id);
         }
-        Ok(subtitle_failures) => { let _ = publication.update(|current| {
+        Ok(subtitle_failures) => update(&store, &writer, &task.id, |current| {
             let conflict = current.outputs.iter().any(|output| {
                 output.kind == "subtitle" && output.error.as_deref() == Some("output_path_conflict")
             });
@@ -1093,7 +1093,7 @@ fn hls_checkpoint_round(
             } else {
                 format!("视频已完成，{subtitle_failures} 条字幕生成失败，可重试")
             });
-        }); },
+        }),
         Err(error) if error == "cancelled" => mark_stopped(&store, &writer, &task.id),
         Err(error) => update(&store, &writer, &task.id, |current| {
             current.state = "failed".into();

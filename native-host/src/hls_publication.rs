@@ -50,7 +50,7 @@ impl<'a> HlsPublication<'a> {
         Ok(())
     }
 
-    pub(crate) fn update(&self, change: impl FnOnce(&mut Task)) -> Result<(), &'static str> {
+    fn update(&self, change: impl FnOnce(&mut Task)) -> Result<(), &'static str> {
         let mut tasks = self.store.repository.tasks.lock().unwrap();
         let task = tasks.iter_mut().find(|task| task.id == self.id).ok_or("task_not_found")?;
         let previous = task.clone();

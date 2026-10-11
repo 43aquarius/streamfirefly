@@ -46,6 +46,7 @@ const proxy = http.createServer((request, response) => {
 await new Promise(resolve => proxy.listen(0, '127.0.0.1', resolve));
 const proxyUrl = `http://127.0.0.1:${proxy.address().port}`;
 const hosts = [];
+const barriers = [];
 function startHost() {
   const child = spawn(exe, [], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, LOCALAPPDATA: temporary, PATH: `${path.dirname(ffmpeg)}${path.delimiter}${process.env.PATH}` } });
   let buffer = Buffer.alloc(0);
@@ -99,6 +100,58 @@ function payload(name, { subtitles = true, fileName = name } = {}) {
       subtitles: subtitles ? [{ language: 'en', label: 'English', extension: 'vtt', manifest: { format: 'hls', baseUrl: `${origin}/${name}/sub.m3u8`, text: `#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:1,\n${origin}/${name}/sub.vtt\n#EXT-X-ENDLIST\n` } }] : [] } };
 }
 const digest = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+async function subtitleEofRecovery(host) {
+  assert.equal(process.platform, 'win32', 'subtitle EOF barrier requires Windows');
+  const directory = path.join(temporary, 'subtitle-barrier');
+  fs.mkdirSync(directory);
+  const watcher = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(root, 'tools/hold-test-subtitle-process.ps1'), '-NativePid', String(host.child.pid), '-ControlDirectory', directory], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  let diagnostic = '';
+  watcher.stderr.on('data', bytes => { diagnostic += bytes.toString(); });
+  const barrier = { watcher, directory, marker: null }; barriers.push(barrier);
+  const checkWatcher = () => {
+    if (fs.existsSync(path.join(directory, 'error'))) throw Error(fs.readFileSync(path.join(directory, 'error'), 'utf8'));
+    if (watcher.exitCode !== null) throw Error(`Subtitle barrier exited early: ${watcher.exitCode} ${diagnostic}`);
+  };
+  await until(() => { checkWatcher(); return fs.existsSync(path.join(directory, 'ready')); }, 'subtitle barrier ready');
+  const request = payload('subtitle-eof');
+  // Multiple valid tracks make the short real FFmpeg processes observable without synthetic media.
+  request.hlsPlan.subtitles = Array.from({ length: 16 }, (_, index) => ({ ...request.hlsPlan.subtitles[0], label: `English ${index}` }));
+  const created = await host.send('task.create', request);
+  assert.equal(created.ok, true, JSON.stringify(created));
+  const marker = await until(() => {
+    checkWatcher();
+    if (!fs.existsSync(path.join(directory, 'held.json'))) return false;
+    try { return JSON.parse(fs.readFileSync(path.join(directory, 'held.json'), 'utf8')); } catch { return false; }
+  }, 'live subtitle FFmpeg');
+  barrier.marker = marker;
+  assert.equal(marker.parent, host.child.pid);
+  assert.match(marker.commandLine, /subtitle-publish-\d+\.vtt/);
+  assert.ok(alive(marker.pid), 'subtitle FFmpeg was not alive before EOF');
+  const mediaHash = digest(created.task.output);
+  await closeHost(host);
+  assert.equal(alive(marker.pid), false, 'EOF left the owned subtitle FFmpeg alive');
+  await until(() => watcher.exitCode !== null, 'subtitle barrier exit');
+  assert.equal(watcher.exitCode, 0, diagnostic);
+  const persisted = JSON.parse(fs.readFileSync(path.join(temporary, 'StreamFireFly/tasks.json'), 'utf8')).tasks.find(task => task.id === created.task.id);
+  assert.ok(['running', 'interrupted'].includes(persisted.state), `EOF turned subtitle work into terminal partial: ${persisted.state}`);
+  assert.equal(persisted.outputs.find(output => output.kind === 'media').state, 'succeeded');
+  assert.ok(persisted.outputs.some(output => output.kind === 'subtitle' && output.state !== 'succeeded'));
+  assert.ok(fs.existsSync(path.join(temporary, 'StreamFireFly/tasks', created.task.id, 'checkpoint.json')));
+  host = startHost();
+  const beforeConfiguration = (await host.send('task.list')).tasks.find(task => task.id === created.task.id);
+  assert.equal(beforeConfiguration.state, 'interrupted');
+  assert.equal((await host.send('network.configure', { mode: 'direct' })).ok, true);
+  const resumed = await settled(host, created.task.id);
+  assert.equal(resumed.state, 'succeeded', JSON.stringify(resumed));
+  assert.equal(digest(resumed.output), mediaHash, 'restart rewrote completed media');
+  for (const output of resumed.outputs.filter(output => output.kind === 'subtitle')) {
+    assert.equal(output.state, 'succeeded');
+    assert.match(fs.readFileSync(output.path, 'utf8'), /WEBVTT[\s\S]*subtitle sentinel/);
+  }
+  console.log('Real subtitle FFmpeg EOF cleanup and automatic subtitle recovery passed');
+  return host;
+}
 try {
   let host = startHost();
   assert.equal((await host.send('network.configure', { mode: 'direct' })).ok, true);
@@ -140,6 +193,7 @@ try {
     }
   }
 
+  host = await subtitleEofRecovery(host);
   await closeHost(host);
   host = startHost();
   assert.equal((await host.send('network.configure', { mode: 'custom', proxyUrl })).ok, true);
@@ -162,11 +216,16 @@ try {
   await closeHost(host);
   console.log('HLS media/subtitle publication, late conflicts, retry preservation and encrypted HLS proxy recovery passed');
 } finally {
-  for (const host of hosts) if (host.child.exitCode === null) await closeHost(host);
+  const cleanup = await Promise.allSettled(hosts.filter(host => host.child.exitCode === null).map(closeHost));
+  for (const barrier of barriers) {
+    fs.writeFileSync(path.join(barrier.directory, 'stop'), 'stop');
+    if (barrier.watcher.exitCode === null) await until(() => barrier.watcher.exitCode !== null, 'barrier cleanup');
+  }
   server.closeAllConnections(); proxy.closeAllConnections();
   await Promise.all([new Promise(resolve => server.close(resolve)), new Promise(resolve => proxy.close(resolve))]);
   const resolved = fs.realpathSync(temporary);
   assert.equal(path.dirname(resolved), fs.realpathSync(os.tmpdir()));
   assert.ok(path.basename(resolved).startsWith('streamfirefly-hls-output-'));
   fs.rmSync(resolved, { recursive: true, force: true });
+  for (const result of cleanup) if (result.status === 'rejected') throw result.reason;
 }
