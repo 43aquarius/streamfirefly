@@ -13,6 +13,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use uuid::Uuid;
 
@@ -21,6 +22,7 @@ pub(crate) struct CaptureManager {
     root: PathBuf,
     errors: Vec<Value>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    worker_panicked: AtomicBool,
 }
 
 impl CaptureManager {
@@ -31,6 +33,7 @@ impl CaptureManager {
             root,
             errors: catalog.errors,
             workers: Mutex::new(Vec::new()),
+            worker_panicked: AtomicBool::new(false),
         }
     }
 
@@ -183,9 +186,25 @@ impl CaptureManager {
     }
 
     fn track_worker(&self, worker: thread::JoinHandle<()>) {
-        let mut workers = self.workers.lock().unwrap();
-        workers.retain(|worker| !worker.is_finished());
-        workers.push(worker);
+        let finished = {
+            let mut workers = self.workers.lock().unwrap();
+            let mut finished = Vec::new();
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    finished.push(workers.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            workers.push(worker);
+            finished
+        };
+        for worker in finished {
+            if worker.join().is_err() {
+                self.worker_panicked.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     pub(crate) fn list(&self) -> Value {
@@ -400,8 +419,11 @@ impl CaptureManager {
         };
         for worker in workers {
             if worker.join().is_err() {
-                errors.push("capture_worker_panicked".to_string());
+                self.worker_panicked.store(true, Ordering::Relaxed);
             }
+        }
+        if self.worker_panicked.load(Ordering::Relaxed) {
+            errors.push("capture_worker_panicked".to_string());
         }
         if errors.is_empty() {
             Ok(())
@@ -444,6 +466,23 @@ fn result_is_finalizing(session: &Arc<Mutex<Session>>) -> bool {
 mod tests {
     use super::*;
     use crate::capture_storage::append;
+    #[test]
+    fn finished_worker_failure_survives_tracking_the_next_worker() {
+        let root = std::env::temp_dir().join(format!("capture-finished-worker-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let manager = CaptureManager::new(root.clone());
+        let worker = thread::spawn(|| panic!("controlled finished worker failure"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        manager.workers.lock().unwrap().push(worker);
+        manager.track_worker(thread::spawn(|| {}));
+        let result = manager.shutdown();
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.is_err_and(|error| error.contains("capture_worker_panicked")), "finished worker panic disappeared during tracking");
+    }
     #[test]
     fn shutdown_is_idempotent_and_reports_worker_failure() {
         let root = std::env::temp_dir().join(format!("capture-shutdown-{}", Uuid::new_v4()));
