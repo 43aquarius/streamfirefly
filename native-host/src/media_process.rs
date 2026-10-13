@@ -1,6 +1,6 @@
 use crate::model::Task;
 use crate::processes::cancel_requested;
-use crate::processes::register_process;
+use crate::processes::spawn_process;
 use crate::processes::unregister_process;
 use crate::runtime::TaskRuntime;
 use crate::task_state::update;
@@ -48,22 +48,23 @@ pub(crate) fn run_ffmpeg_with_progress(
     writer: &Writer,
     task: &Task,
     args: Vec<String>,
+    progress_path: &std::path::Path,
     duration: f64,
     progress_start: u8,
     progress_span: u8,
     message: &str,
 ) -> Result<(), String> {
-    let mut child = Command::new(bundled_tool("ffmpeg.exe"))
+    let child = spawn_process(store, &task.id, Command::new(bundled_tool("ffmpeg.exe"))
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()
+    )
         .map_err(|error| error.to_string())?;
     let stdout = child
+        .lock().map_err(|_| "process_lock_poisoned")?
         .stdout
         .take()
         .ok_or_else(|| "ffmpeg_progress_unavailable".to_string())?;
-    let child = register_process(store, &task.id, child);
     let position = Arc::new(Mutex::new(0.0_f64));
     let reader_position = position.clone();
     thread::spawn(move || {
@@ -93,10 +94,7 @@ pub(crate) fn run_ffmpeg_with_progress(
             unregister_process(store, &task.id, &child);
             return Err("cancelled".into());
         }
-        let bytes = task
-            .output
-            .as_deref()
-            .and_then(|path| fs::metadata(path).ok())
+        let bytes = fs::metadata(progress_path)
             .map(|metadata| metadata.len())
             .unwrap_or(last_bytes);
         let speed = (bytes.saturating_sub(last_bytes) as f64

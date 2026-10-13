@@ -13,6 +13,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use uuid::Uuid;
 
@@ -21,6 +22,7 @@ pub(crate) struct CaptureManager {
     root: PathBuf,
     errors: Vec<Value>,
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    worker_panicked: AtomicBool,
 }
 
 impl CaptureManager {
@@ -31,6 +33,7 @@ impl CaptureManager {
             root,
             errors: catalog.errors,
             workers: Mutex::new(Vec::new()),
+            worker_panicked: AtomicBool::new(false),
         }
     }
 
@@ -183,9 +186,25 @@ impl CaptureManager {
     }
 
     fn track_worker(&self, worker: thread::JoinHandle<()>) {
-        let mut workers = self.workers.lock().unwrap();
-        workers.retain(|worker| !worker.is_finished());
-        workers.push(worker);
+        let finished = {
+            let mut workers = self.workers.lock().unwrap();
+            let mut finished = Vec::new();
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    finished.push(workers.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            workers.push(worker);
+            finished
+        };
+        for worker in finished {
+            if worker.join().is_err() {
+                self.worker_panicked.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     pub(crate) fn list(&self) -> Value {
@@ -357,27 +376,66 @@ impl CaptureManager {
     }
 }
 
-impl Drop for CaptureManager {
-    fn drop(&mut self) {
-        if let Ok(sessions) = self.sessions.lock() {
-            for session in sessions.values() {
-                if let Ok(mut current) = session.lock() {
-                    if ["armed", "capturing", "stopping", "finalizing"]
-                        .contains(&current.snapshot.state.as_str())
-                    {
-                        current.stop = true;
-                        current.snapshot.state = "interrupted".into();
-                        current.snapshot.error = Some("capture_host_stopped".into());
-                        let _ = save(&current);
-                    }
+impl CaptureManager {
+    /// Stops every active session and waits for its worker threads. Idempotent: a second
+    /// call finds no active sessions and no tracked workers. Drop reuses this so a normal
+    /// EOF shutdown and a destructor share one stop mechanism.
+    pub(crate) fn shutdown(&self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        let sessions: Vec<Arc<Mutex<Session>>> = match self.sessions.lock() {
+            Ok(sessions) => sessions.values().cloned().collect(),
+            Err(_) => {
+                errors.push("capture_unavailable".to_string());
+                Vec::new()
+            }
+        };
+        for session in &sessions {
+            let mut current = match session.lock() {
+                Ok(current) => current,
+                Err(_) => {
+                    errors.push("capture_unavailable".to_string());
+                    continue;
+                }
+            };
+            if ["armed", "capturing", "stopping", "finalizing"]
+                .contains(&current.snapshot.state.as_str())
+            {
+                current.stop = true;
+                current.snapshot.state = "interrupted".into();
+                current.snapshot.error = Some("capture_host_stopped".into());
+                if save(&current).is_err() {
+                    errors.push(format!("capture_checkpoint_failed:{}", current.snapshot.id));
                 }
             }
         }
-        if let Ok(mut workers) = self.workers.lock() {
-            for worker in workers.drain(..) {
-                let _ = worker.join();
+        // Collect the handles and drop the locks before joining: a worker may still need
+        // the session or worker table while finishing its cleanup.
+        let workers: Vec<thread::JoinHandle<()>> = match self.workers.lock() {
+            Ok(mut workers) => workers.drain(..).collect(),
+            Err(_) => {
+                errors.push("capture_unavailable".to_string());
+                Vec::new()
+            }
+        };
+        for worker in workers {
+            if worker.join().is_err() {
+                self.worker_panicked.store(true, Ordering::Relaxed);
             }
         }
+        if self.worker_panicked.load(Ordering::Relaxed) {
+            errors.push("capture_worker_panicked".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join(","))
+        }
+    }
+}
+
+impl Drop for CaptureManager {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
     }
 }
 
@@ -408,6 +466,34 @@ fn result_is_finalizing(session: &Arc<Mutex<Session>>) -> bool {
 mod tests {
     use super::*;
     use crate::capture_storage::append;
+    #[test]
+    fn finished_worker_failure_survives_tracking_the_next_worker() {
+        let root = std::env::temp_dir().join(format!("capture-finished-worker-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let manager = CaptureManager::new(root.clone());
+        let worker = thread::spawn(|| panic!("controlled finished worker failure"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !worker.is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        manager.workers.lock().unwrap().push(worker);
+        manager.track_worker(thread::spawn(|| {}));
+        let result = manager.shutdown();
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.is_err_and(|error| error.contains("capture_worker_panicked")), "finished worker panic disappeared during tracking");
+    }
+    #[test]
+    fn shutdown_is_idempotent_and_reports_worker_failure() {
+        let root = std::env::temp_dir().join(format!("capture-shutdown-{}", Uuid::new_v4()));
+        let manager = CaptureManager::new(root.clone());
+        manager.open(&json!({"origin":"chrome-extension://abcdefghijklmnopabcdefghijklmnop"})).unwrap();
+        manager.shutdown().unwrap();
+        manager.shutdown().unwrap();
+        manager.workers.lock().unwrap().push(thread::spawn(|| panic!("controlled worker failure")));
+        assert!(manager.shutdown().unwrap_err().contains("capture_worker_panicked"));
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn rejects_untrusted_origins_before_creating_files() {
         let root = std::env::temp_dir().join(format!("capture-test-{}", Uuid::new_v4()));

@@ -1,10 +1,10 @@
 use crate::paths::state_path;
-use crate::recovery::start_recovery_once;
+use crate::recovery::network_ready;
+use crate::recovery::request_recovery;
 use crate::repository::sanitized_task;
 use crate::repository::sanitized_tasks;
 use crate::repository::save_store;
 use crate::runtime::load_store;
-use crate::processes::stop_process;
 use crate::runtime::TaskRuntime;
 use crate::scheduler::start_download;
 use crate::task_control::delete_task;
@@ -82,6 +82,7 @@ pub(crate) fn run() -> io::Result<()> {
                         for task in store.repository.tasks.lock().unwrap().iter_mut() {
                             task.network = config.clone();
                         }
+                        network_ready(&store, &writer);
                         json!({"version":1,"id":id,"ok":true})
                     }
                     Err(error) => json!({"version":1,"id":id,"ok":false,"error":error}),
@@ -162,29 +163,35 @@ pub(crate) fn run() -> io::Result<()> {
         };
         emit(&writer, response);
         if message_type == "task.list" {
-            start_recovery_once(&store, &writer);
+            request_recovery(&store, &writer);
         }
     }
-    shutdown_downloads(&store)
+    shutdown_host(&store, &captures)
 }
 
-/// Ends every download child before the host exits so no orphaned writer outlives it.
-/// Holding the task list blocks runner updates, so persisted states stay resumable on the next start.
-fn shutdown_downloads(store: &TaskRuntime) -> ! {
+/// Ends every download child so no orphaned writer outlives the host.
+pub(crate) fn shutdown_downloads(store: &TaskRuntime) -> Result<(), String> {
+    crate::processes::shutdown_processes(store)
+}
+
+/// Normal EOF shutdown: freeze task scheduling and retries first, end the download
+/// children, then stop capture sessions and wait for their workers. The task map stays
+/// locked until exit so an output move and its saved state land together or not at all.
+/// Any cleanup failure exits non-zero instead of pretending success.
+fn shutdown_host(store: &TaskRuntime, captures: &crate::capture::CaptureManager) -> ! {
+    store.exiting.store(true, std::sync::atomic::Ordering::SeqCst);
+    let download_result = shutdown_downloads(store);
+    let capture_result = captures.shutdown();
     let _tasks = store
         .repository
         .tasks
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let ids: Vec<String> = store
-        .processes
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .keys()
-        .cloned()
-        .collect();
-    for id in ids {
-        stop_process(store, &id);
+    match (download_result, capture_result) {
+        (Ok(()), Ok(())) => std::process::exit(0),
+        (download, capture) => {
+            eprintln!("streamfirefly shutdown incomplete: download={download:?}, capture={capture:?}");
+            std::process::exit(1)
+        }
     }
-    std::process::exit(0)
 }

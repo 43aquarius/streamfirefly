@@ -12,6 +12,7 @@ mod dash;
 mod dash_download;
 mod hls;
 mod hls_download;
+mod hls_publication;
 mod hls_plan;
 mod http_download;
 mod integrations;

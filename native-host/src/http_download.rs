@@ -2,7 +2,7 @@ use crate::model::Task;
 use crate::processes::cancel_requested;
 use crate::processes::pause_requested;
 use crate::processes::mark_stopped;
-use crate::processes::register_process;
+use crate::processes::spawn_process;
 use crate::processes::stop_process;
 use crate::processes::unregister_process;
 use crate::runtime::TaskRuntime;
@@ -64,8 +64,8 @@ pub(crate) fn probe_size(store: &TaskRuntime, task: &Task) -> ProbeInfo {
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let child = match command.spawn() {
-        Ok(child) => register_process(store, &task.id, child),
+    let child = match spawn_process(store, &task.id, &mut command) {
+        Ok(child) => child,
         Err(_) => return ProbeInfo::default(),
     };
     loop {
@@ -154,13 +154,13 @@ pub(crate) fn start_single_http_download(
     ];
     add_request_args(&mut args, &task, &task.url);
     args.push(task.url.clone());
-    let child = match Command::new("curl")
+    let child = match spawn_process(&store, &task.id, Command::new("curl")
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+    )
     {
-        Ok(child) => register_process(&store, &task.id, child),
+        Ok(child) => child,
         Err(error) => {
             update(&store, &writer, &task.id, |t| {
                 t.state = "failed".into();
@@ -367,13 +367,13 @@ pub(crate) fn start_parallel_http_download(
             ];
             add_request_args(&mut args, &task, &task.url);
             args.push(task.url.clone());
-            match Command::new("curl")
+            match spawn_process(&store, &task.id, Command::new("curl")
                 .args(args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .spawn()
+            )
             {
-                Ok(child) => transfer.child = Some(register_process(&store, &task.id, child)),
+                Ok(child) => transfer.child = Some(child),
                 Err(_) => {
                     stop_process(&store, &task.id);
                     let _ = fs::remove_dir_all(&part_dir);

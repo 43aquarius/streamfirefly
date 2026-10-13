@@ -34,7 +34,7 @@ function trackDownloadBadge(task) { const contextId = downloadBadge.apply(task);
 const native = createNative(api, workspace.notifyWorkspaceMessage, message => {
   if (message.type === "task.progress") trackDownloadBadge(message.task);
   if (message.type === "task.deleted") { const contextId = downloadBadge.remove(message.id); if (contextId) resources.refreshBadgeForContext(contextId); }
-});
+}, resetNativeInit);
 const { nativeRequestPromise, nativeInfo } = native;
 // A fresh install opens the settings page, which guides the one-click helper installation.
 api.runtime.onInstalled?.addListener(details => { if (details?.reason === "install") api.runtime.openOptionsPage()?.catch?.(() => {}); });
@@ -189,14 +189,44 @@ function seedDownloadBadge() {
   nativeRequestPromise("task.list").then(result => { if (!result?.ok) throw new Error(result?.error || "task_list_failed"); for (const task of result.tasks || []) trackDownloadBadge(task); }).catch(() => { downloadBadgeSeeded = false; });
 }
 
+// task.list can trigger recovery on the helper, so it must not run before the user's
+// network policy is configured. Concurrent callers share one initialization; a settings
+// change re-configures, and a disconnect resets everything so the next connection starts over.
+let nativeInitPromise = null;
+let configuredNetwork = null;
+let nativeInitGeneration = 0;
+function resetNativeInit() {
+  nativeInitGeneration += 1;
+  nativeInitPromise = null;
+  configuredNetwork = null;
+  downloadBadgeSeeded = false;
+}
 async function ensureNativeConfigured() {
   await settings.ready;
-  const info = await nativeInfo();
-  if (!info.ok) return info;
-  seedDownloadBadge();
-  const current = settings.get();
-  const configured = await nativeRequestPromise("network.configure", { mode: current.proxyMode, proxyUrl: current.proxyUrl });
-  return configured?.ok ? info : configured;
+  if (nativeInitPromise) return nativeInitPromise;
+  const generation = nativeInitGeneration;
+  const initialization = (async () => {
+    const info = await nativeInfo();
+    if (!info.ok) return info;
+    while (generation === nativeInitGeneration) {
+      const current = settings.get();
+      const wanted = { mode: current.proxyMode, proxyUrl: current.proxyUrl };
+      if (configuredNetwork?.mode !== wanted.mode || configuredNetwork?.proxyUrl !== wanted.proxyUrl) {
+        const configured = await nativeRequestPromise("network.configure", wanted);
+        if (generation !== nativeInitGeneration) break;
+        if (!configured?.ok) return configured;
+        configuredNetwork = wanted;
+        const latest = settings.get();
+        if (latest.proxyMode !== wanted.mode || latest.proxyUrl !== wanted.proxyUrl) continue;
+      }
+      seedDownloadBadge();
+      return info;
+    }
+    return { ok: false, error: "native_host_disconnected" };
+  })();
+  nativeInitPromise = initialization;
+  try { return await initialization; }
+  finally { if (nativeInitPromise === initialization) nativeInitPromise = null; }
 }
 
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {

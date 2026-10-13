@@ -24,6 +24,9 @@ let sidePanelBehavior = null;
 const sidePanelCalls = [];
 let rejectSidePanelOpen = false, rejectSidePanelClose = false;
 let nativeInfoError = null;
+let nativeConfigureError = null;
+let deferNativeConfigure = false;
+const deferredNativeConfigure = [];
 let nativeSilent = false;
 let nextTabId = 100;
 const tabsById = new Map([
@@ -68,7 +71,16 @@ const api = {
     connectNative: () => ({
       onMessage: { addListener: listener => { nativeListeners.message = listener; } },
       onDisconnect: { addListener: listener => { nativeListeners.disconnect = listener; } },
-      postMessage: message => { nativePosted.push(structuredClone(message)); if (nativeSilent) return; queueMicrotask(() => nativeListeners.message(nativeInfoError && message.type === 'host.info' ? { id: message.id, ok: false, error: nativeInfoError } : { version: 1, id: message.id, ok: true, protocolVersion: 3, supportedProtocolVersions: [3], capabilities: ['inline-hls-v1', 'task-control-v1', 'hls-selection-v1', 'task-output-group-v1', 'hls-segment-engine-v1', 'hls-live-engine-v1', 'task-queue-v1', 'task-idempotency-v1', 'integration-program-v1', 'capture-stream-v1', 'network-policy-v1'] })); }
+      postMessage: message => {
+        nativePosted.push(structuredClone(message));
+        if (message.type === 'network.configure' && deferNativeConfigure) { deferredNativeConfigure.push(message); return; }
+        if (nativeSilent) return;
+        queueMicrotask(() => {
+          if (nativeInfoError && message.type === 'host.info') { nativeListeners.message({ id: message.id, ok: false, error: nativeInfoError }); return; }
+          if (nativeConfigureError && message.type === 'network.configure') { nativeListeners.message({ id: message.id, ok: false, error: nativeConfigureError }); return; }
+          nativeListeners.message({ version: 1, id: message.id, ok: true, protocolVersion: 3, supportedProtocolVersions: [3], capabilities: ['inline-hls-v1', 'task-control-v1', 'hls-selection-v1', 'task-output-group-v1', 'hls-segment-engine-v1', 'hls-live-engine-v1', 'task-queue-v1', 'task-idempotency-v1', 'integration-program-v1', 'capture-stream-v1', 'network-policy-v1'] });
+        });
+      }
     })
   },
   tabs: {
@@ -116,6 +128,62 @@ const send = (message, sender = {}) => new Promise((resolve, reject) => {
 const nativeInfo = await send({ type: 'native.connect' });
 if (!nativeInfo.ok || !nativeInfo.capabilities.includes('inline-hls-v1') || !nativeInfo.capabilities.includes('task-control-v1')) throw new Error(`Native capability negotiation failed: ${JSON.stringify(nativeInfo)}`);
 if (!nativePosted.some(message => message.type === 'network.configure' && message.payload.mode === 'system')) throw new Error('Native connection did not configure the download network policy');
+const initOrder = nativePosted.map(message => message.type).filter(type => ['host.info', 'network.configure', 'task.list'].includes(type));
+if (initOrder.join(',') !== 'host.info,network.configure,task.list') throw new Error(`Native initialization must configure the network before task.list recovery, got: ${initOrder.join(',')}`);
+const postedAfterFirstInit = nativePosted.length;
+await Promise.all([send({ type: 'native.connect' }), send({ type: 'native.connect' }), send({ type: 'native.connect' })]);
+if (nativePosted.length !== postedAfterFirstInit) throw new Error('Concurrent native initialization repeated network.configure or task.list');
+nativeListeners.disconnect();
+await settle();
+deferNativeConfigure = true;
+const initialPolicy = send({ type: 'native.connect' });
+await flush();
+if (deferredNativeConfigure.length !== 1) throw new Error('Network configuration was not suspended');
+listeners.storageChanged({ proxyMode: { newValue: 'custom' }, proxyUrl: { newValue: 'http://127.0.0.1:7897' } }, 'local');
+const newPolicyTask = send({ type: 'task.create', payload: { url: 'https://media.example/clip.mp4', fileName: 'policy-race', mime: 'video/mp4' } });
+await flush();
+deferNativeConfigure = false;
+for (const message of deferredNativeConfigure.splice(0)) nativeListeners.message({ id: message.id, ok: true });
+await initialPolicy;
+await newPolicyTask;
+const policyTraffic = nativePosted.slice(postedAfterFirstInit);
+const lastPolicy = policyTraffic.filter(message => message.type === 'network.configure').at(-1);
+if (lastPolicy?.payload.mode !== 'custom' || lastPolicy.payload.proxyUrl !== 'http://127.0.0.1:7897') throw new Error('A task was released under the stale policy while initialization was pending');
+if (policyTraffic.findIndex(message => message.type === 'task.create') < policyTraffic.lastIndexOf(lastPolicy)) throw new Error('A task started before the latest proxy policy was configured');
+listeners.storageChanged({ proxyMode: { newValue: 'direct' }, proxyUrl: { newValue: '' } }, 'local');
+deferNativeConfigure = true;
+const reconfiguration = send({ type: 'native.connect' });
+await flush();
+listeners.storageChanged({ proxyMode: { newValue: 'custom' }, proxyUrl: { newValue: 'http://127.0.0.1:7898' } }, 'local');
+const latestPolicy = send({ type: 'native.connect' });
+await flush();
+deferNativeConfigure = false;
+for (const message of deferredNativeConfigure.splice(0)) nativeListeners.message({ id: message.id, ok: true });
+await Promise.all([reconfiguration, latestPolicy]);
+if (nativePosted.filter(message => message.type === 'network.configure').at(-1)?.payload.proxyUrl !== 'http://127.0.0.1:7898') throw new Error('Reconfiguration did not converge to the latest network policy');
+listeners.storageChanged({ proxyMode: { newValue: 'system' }, proxyUrl: { newValue: '' } }, 'local');
+deferNativeConfigure = true;
+const disconnectedConfigure = send({ type: 'native.connect' });
+await flush();
+const staleConfigure = deferredNativeConfigure.splice(0);
+nativeListeners.disconnect();
+if ((await disconnectedConfigure).ok) throw new Error('Disconnected configuration was reported ready');
+deferNativeConfigure = false;
+await send({ type: 'native.connect' });
+const afterReconnect = nativePosted.length;
+for (const message of staleConfigure) nativeListeners.message({ id: message.id, ok: true });
+await send({ type: 'native.connect' });
+if (nativePosted.length !== afterReconnect) throw new Error('Stale configuration response invalidated the new connection');
+nativeListeners.disconnect();
+await settle();
+const postedAfterDisconnect = nativePosted.length;
+nativeConfigureError = 'proxy_url_invalid';
+const failedConfigure = await send({ type: 'native.connect' });
+if (failedConfigure.ok || failedConfigure.error !== 'proxy_url_invalid') throw new Error(`Failed network.configure was not surfaced: ${JSON.stringify(failedConfigure)}`);
+if (nativePosted.slice(postedAfterDisconnect).some(message => message.type === 'task.list')) throw new Error('task.list recovery ran although network.configure failed');
+nativeConfigureError = null;
+if (!(await send({ type: 'native.connect' })).ok) throw new Error('Configuration failure was cached and prevented reconnection');
+if (!nativePosted.some((message, index) => index > postedAfterDisconnect && message.type === 'task.list')) throw new Error('Reconnection after a failed configure did not restore the download badge');
 const rejectedV1 = await send({ type: 'task.create', payload: { hlsPlan: { version: 1 } } });
 if (rejectedV1.ok || rejectedV1.error !== 'hls_plan_version_unsupported') throw new Error('Legacy HLS plan was accepted');
 const acceptedV2 = await send({ type: 'task.create', payload: { hlsPlan: { version: 2 } } });

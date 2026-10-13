@@ -34,6 +34,7 @@ use crate::segment_transfer::{
     authorization_error, curl_once, retry_after_seconds, retryable_error, wait_retry,
 };
 use crate::task_state::update;
+use crate::hls_publication::{publish_work_path, HlsPublication};
 use crate::wire::Writer;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -366,6 +367,7 @@ pub(crate) fn merge_hls_checkpoint(
     output: &str,
     checkpoint: &HlsCheckpoint,
     work_dir: &Path,
+    publication: &HlsPublication<'_>,
 ) -> Result<usize, String> {
     let video = checkpoint
         .tracks
@@ -386,6 +388,11 @@ pub(crate) fn merge_hls_checkpoint(
                 .is_some_and(|path| Path::new(path).is_file())
     });
     if !media_already_done {
+        let output_path = Path::new(output);
+        let temporary = publish_work_path(output_path, &task.id);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|_| "path_not_writable".to_string())?;
+        }
         let mut args = vec![
             "-nostdin".into(),
             "-y".into(),
@@ -414,22 +421,33 @@ pub(crate) fn merge_hls_checkpoint(
             .into(),
             "-c".into(),
             "copy".into(),
-            output.into(),
+            temporary.to_string_lossy().into_owned(),
         ]);
         match run_ffmpeg_with_progress(
             store,
             writer,
             task,
             args,
+            &temporary,
             checkpoint.plan.duration,
             90,
             10,
             "切片下载完成，正在无转码合并",
         ) {
-            Ok(()) => update(store, writer, &task.id, |current| {
-                set_output_state(current, "media", 0, "succeeded", None)
-            }),
+            Ok(()) => {
+                let published = publication.publish("media", 0, &temporary, output_path);
+                match published {
+                    Ok(()) => {},
+                    Err(error) => {
+                        update(store, writer, &task.id, |current| {
+                            set_output_state(current, "media", 0, "failed", Some(error.into()))
+                        });
+                        return Err(error.into());
+                    }
+                }
+            }
             Err(error) => {
+                let _ = fs::remove_file(&temporary);
                 if error != "cancelled" {
                     update(store, writer, &task.id, |current| {
                         set_output_state(current, "media", 0, "failed", Some(error.clone()))
@@ -480,6 +498,7 @@ pub(crate) fn merge_hls_checkpoint(
             set_output_state(current, "subtitle", subtitle_index, "running", None)
         });
         let playlist = local_playlist(subtitle, &work_dir.join(&subtitle.id))?;
+        let temporary = publish_work_path(Path::new(&path), &task.id);
         let args = vec![
             "-nostdin".into(),
             "-y".into(),
@@ -493,7 +512,7 @@ pub(crate) fn merge_hls_checkpoint(
             "0:s:0".into(),
             "-c:s".into(),
             "webvtt".into(),
-            path,
+            temporary.to_string_lossy().into_owned(),
         ];
         let start = 90 + ((subtitle_index * 10) / subtitle_count.max(1)) as u8;
         let span = (10 / subtitle_count.max(1)).max(1) as u8;
@@ -502,16 +521,36 @@ pub(crate) fn merge_hls_checkpoint(
             writer,
             task,
             args,
+            &temporary,
             subtitle.duration,
             start,
             span,
             "正在生成字幕文件",
         ) {
-            Ok(()) => update(store, writer, &task.id, |current| {
-                set_output_state(current, "subtitle", subtitle_index, "succeeded", None)
-            }),
-            Err(error) if error == "cancelled" => return Err(error),
+            Ok(()) => {
+                let published = publication.publish("subtitle", subtitle_index, &temporary, Path::new(&path));
+                match published {
+                    Ok(()) => {},
+                    Err(error) => {
+                        subtitle_failures += 1;
+                        update(store, writer, &task.id, |current| {
+                            set_output_state(
+                                current,
+                                "subtitle",
+                                subtitle_index,
+                                "failed",
+                                Some(error.into()),
+                            )
+                        });
+                    }
+                }
+            }
+            Err(error) if error == "cancelled" => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
             Err(error) => {
+                let _ = fs::remove_file(&temporary);
                 subtitle_failures += 1;
                 update(store, writer, &task.id, |current| {
                     set_output_state(current, "subtitle", subtitle_index, "failed", Some(error))
@@ -1016,6 +1055,10 @@ fn hls_checkpoint_round(
         }
         current.message = Some("切片下载完成，正在合并".into());
     });
+    let publication = match HlsPublication::begin(&store, Some(&writer), &task.id) {
+        Ok(publication) => publication,
+        Err(_) => return None,
+    };
     match merge_hls_checkpoint(
         &store,
         &writer,
@@ -1023,37 +1066,35 @@ fn hls_checkpoint_round(
         &output,
         &checkpoint_value,
         &work_dir,
+        &publication,
     ) {
         Ok(0) => {
-            let _ = fs::remove_dir_all(&work_dir);
-            update(&store, &writer, &task.id, |current| {
-                current.state = "succeeded".into();
-                current.phase = "completed".into();
-                current.progress = 100;
-                current.active_connections = 0;
-                current.eta_seconds = Some(0);
-                current.checkpoint_state = Some("cleaned".into());
-                current.resume_requirement = None;
-                current.error = None;
-                current.message = Some(if task.live_recording {
-                    "直播录制已停止并保存".into()
-                } else {
-                    "HLS 视频和所选字幕下载完成".into()
-                });
-            });
+            let _ = publication.finish(&work_dir);
             clear_stop(&store, &task.id);
         }
         Ok(subtitle_failures) => update(&store, &writer, &task.id, |current| {
+            let conflict = current.outputs.iter().any(|output| {
+                output.kind == "subtitle" && output.error.as_deref() == Some("output_path_conflict")
+            });
             current.state = "partial".into();
             current.phase = "partial".into();
             current.progress = 100;
             current.active_connections = 0;
             current.eta_seconds = Some(0);
             current.checkpoint_state = Some("recoverable".into());
-            current.error = Some("subtitle_output_failed".into());
-            current.message = Some(format!(
-                "视频已完成，{subtitle_failures} 条字幕生成失败，可重试"
-            ));
+            current.error = Some(
+                if conflict {
+                    "output_path_conflict"
+                } else {
+                    "subtitle_output_failed"
+                }
+                .into(),
+            );
+            current.message = Some(if conflict {
+                "输出文件已存在或被其他任务占用，请保留原文件并新建任务。".into()
+            } else {
+                format!("视频已完成，{subtitle_failures} 条字幕生成失败，可重试")
+            });
         }),
         Err(error) if error == "cancelled" => mark_stopped(&store, &writer, &task.id),
         Err(error) => update(&store, &writer, &task.id, |current| {
@@ -1061,7 +1102,11 @@ fn hls_checkpoint_round(
             current.phase = "failed".into();
             current.error = Some(error.clone());
             current.checkpoint_state = Some("recoverable".into());
-            current.message = Some("切片已保存，但 FFmpeg 合并失败".into());
+            current.message = Some(if error == "output_path_conflict" {
+                "输出文件已存在或被其他任务占用，请保留原文件并新建任务。".into()
+            } else {
+                "切片已保存，但 FFmpeg 合并失败".into()
+            });
         }),
     }
     None
