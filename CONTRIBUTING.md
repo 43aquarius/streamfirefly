@@ -30,6 +30,7 @@ English contributions are welcome. Please follow the same rules below.
   ```
 
 - 按 PR 模板填写改了什么、为什么改、实际运行了哪些命令，以及 AI 使用说明。
+- PR 打开或更新后会自动运行检查：改了扩展或界面代码时跑类型检查、扩展校验和单元测试，改了 `native-host/` 时再跑本地助手测试，只改文档时跳过。结果显示在 PR 页面底部；第一次贡献的 PR 需要维护者批准后才会开始运行。
 
 ## 依赖升级
 
