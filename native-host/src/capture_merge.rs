@@ -29,6 +29,16 @@ fn stalled(idle: Duration) -> bool {
     idle >= STALL_LIMIT
 }
 
+/// Failures reported by finalization itself. Regenerating starts without them, while an
+/// interruption recorded during capture still marks the result as incomplete.
+const FINALIZATION_ERRORS: [&str; 6] = ["capture_no_media_data", "capture_initialization_missing", "capture_disk_insufficient", "capture_merge_failed", "capture_merge_stalled", "capture_merge_timeout"];
+
+pub(crate) fn clear_finalization_error(error: &mut Option<String>) {
+    if error.as_deref().is_some_and(|code| FINALIZATION_ERRORS.contains(&code)) {
+        *error = None;
+    }
+}
+
 pub(crate) fn finalize(session: &Arc<Mutex<Session>>) {
     let (directory, tracks) = {
         let current = session.lock().unwrap();
@@ -310,6 +320,20 @@ mod tests {
         assert_eq!(merge_ceiling(0), Duration::from_secs(120));
         assert_eq!(merge_ceiling(1024 * 1024 * 1024), Duration::from_secs(120 + 102));
         assert_eq!(merge_ceiling(64 * 1024 * 1024 * 1024), Duration::from_secs(120 + 6553));
+    }
+
+    #[test]
+    fn regenerating_forgets_only_finalization_failures() {
+        for code in FINALIZATION_ERRORS {
+            let mut error = Some(code.to_string());
+            clear_finalization_error(&mut error);
+            assert_eq!(error, None, "{code}");
+        }
+        for code in ["capture_source_unavailable", "capture_host_stopped", "capture_disconnected"] {
+            let mut error = Some(code.to_string());
+            clear_finalization_error(&mut error);
+            assert_eq!(error.as_deref(), Some(code));
+        }
     }
 
     #[test]

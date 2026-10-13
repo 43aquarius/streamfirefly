@@ -1,7 +1,7 @@
 use crate::capture_catalog::{load, save_index};
 use crate::capture_diagnostics::{collect, record};
 use crate::capture_export::{exported_outputs, remove_exported, reveal_in_explorer, reveal_target};
-use crate::capture_merge::finalize;
+use crate::capture_merge::{clear_finalization_error, finalize};
 use crate::capture_model::{Session, Snapshot};
 use crate::capture_socket::receive;
 use crate::capture_storage::save;
@@ -335,9 +335,13 @@ impl CaptureManager {
                 return Err("capture_worker_stopping".into());
             }
             let previous = current.snapshot.state.clone();
+            let previous_error = current.snapshot.error.clone();
+            // The last attempt's own failure must not decide this one; capture interruptions stay.
+            clear_finalization_error(&mut current.snapshot.error);
             current.snapshot.state = "finalizing".into();
             if save(&current).is_err() {
                 current.snapshot.state = previous;
+                current.snapshot.error = previous_error;
                 return Err("capture_checkpoint_failed".into());
             }
             current.worker_active = true;
