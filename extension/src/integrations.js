@@ -23,7 +23,10 @@ export function createIntegrations(api, resources, nativeRequest, evaluate) {
     if (!candidate || !/^https?:\/\//i.test(candidate.url) || candidate.inlineManifest) throw new Error("该资源没有可直接交接的 HTTP 地址，请使用内置下载");
     assertSiteAllowed(candidate.url, candidate.pageUrl, state.pageUrl);
     const headers = Object.fromEntries(Object.entries(candidate.requestHeaders || {}).map(([key, value]) => [key.toLowerCase(), value]));
-    const values = { url: candidate.url, pageUrl: candidate.pageUrl || "", title: candidate.pageTitle || "媒体", fileName: candidate.pageTitle || "媒体", ext: new URL(candidate.url).pathname.split(".").at(-1) || "", mime: candidate.mime || "", size: candidate.size == null ? "" : String(candidate.size), now: new Date().toISOString().replace(/[:.]/g, "-") };
+    // Only a real extension counts: without a dot the whole pathname would leak in (e.g. "/watch").
+    const pathname = new URL(candidate.url).pathname;
+    const ext = pathname.includes(".") ? pathname.split(".").at(-1) || "" : "";
+    const values = { url: candidate.url, pageUrl: candidate.pageUrl || "", title: candidate.pageTitle || "媒体", fileName: candidate.pageTitle || "媒体", ext, mime: candidate.mime || "", size: candidate.size == null ? "" : String(candidate.size), now: new Date().toISOString().replace(/[:.]/g, "-") };
     values.token = secrets.get(profile.id) || "";
     for (const field of profile.sensitiveFields) values[field] = candidate.extraction && !candidate.extraction.observed ? "" : field === "referer" ? candidate.referer || candidate.pageUrl || "" : headers[field === "userAgent" ? "user-agent" : field] || "";
     if (Object.values(values).some(value => typeof value !== "string" || value.length > 16384 || /[\r\n\0]/.test(value))) throw new Error("资源参数包含非法内容");

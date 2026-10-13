@@ -52,7 +52,10 @@ export async function buildHlsPlan(selection: PlanSelection) {
 }
 
 export function candidatePayload(candidate: MediaCandidate) {
-  return { url: candidate.url, candidateId: candidate.id, title: candidate.title || candidate.pageTitle || "streamfirefly-download", pageTitle: candidate.pageTitle || null, pageUrl: candidate.pageUrl || null, mime: candidate.mime || null, contentDisposition: candidate.contentDisposition || null, referer: candidate.referer || candidate.pageUrl || null, requestHeaders: candidate.requestHeaders || {}, inlineManifest: candidate.inlineManifest || null };
+  // No invented title: a placeholder like "streamfirefly-download" would win over the
+  // server file name and the URL name in page-title naming, and the native host already
+  // falls back to its own placeholder for the task's display title.
+  return { url: candidate.url, candidateId: candidate.id, title: candidate.title || candidate.pageTitle || null, pageTitle: candidate.pageTitle || null, pageUrl: candidate.pageUrl || null, mime: candidate.mime || null, contentDisposition: candidate.contentDisposition || null, referer: candidate.referer || candidate.pageUrl || null, requestHeaders: candidate.requestHeaders || {}, inlineManifest: candidate.inlineManifest || null };
 }
 
 export async function prepareDefaultDownload(candidate: MediaCandidate, fetchManifest: ManifestLoader) {

@@ -40,6 +40,60 @@ test("converts time range to a safe derived playlist", () => {
   expect(derived.text).not.toContain("1.m4s");
 });
 
+test("normalizes byte ranges so partial clips keep explicit offsets", () => {
+  const manifest = parseHls(`#EXTM3U
+#EXT-X-TARGETDURATION:5
+#EXT-X-MAP:URI="init.mp4",BYTERANGE="50@10"
+#EXT-X-BYTERANGE:100@0
+#EXTINF:5,
+media.ts
+#EXT-X-BYTERANGE:120
+#EXTINF:5,
+media.ts
+#EXT-X-BYTERANGE:80
+#EXTINF:5,
+media.ts
+#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8");
+  expect(manifest.segments.map(segment => segment.byteRange)).toEqual(["100@0", "120@100", "80@220"]);
+  expect(manifest.segments[0].initMap?.byteRange).toBe("50@10");
+  // Clipping away the first segment must not leave a dangling implicit offset that the
+  // native host would reject with hls_byte_range_offset_missing.
+  const derived = deriveMediaPlaylist(manifest, 1, 2);
+  expect(derived.text).toContain('#EXT-X-MAP:URI="https://media.example/v/init.mp4",BYTERANGE="50@10"');
+  expect(derived.text).toContain("#EXT-X-BYTERANGE:120@100");
+  expect(derived.text).toContain("#EXT-X-BYTERANGE:80@220");
+  expect(derived.text).not.toMatch(/#EXT-X-BYTERANGE:\d+$/m);
+});
+
+test("an implicit first byte range starts at zero", () => {
+  const manifest = parseHls(`#EXTM3U
+#EXT-X-TARGETDURATION:5
+#EXT-X-BYTERANGE:100
+#EXTINF:5,
+media.ts
+#EXT-X-BYTERANGE:120
+#EXTINF:5,
+media.ts
+#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8");
+  expect(manifest.segments.map(segment => segment.byteRange)).toEqual(["100@0", "120@100"]);
+});
+
+test("time ranges at or past the end select the final segment, not the whole video", () => {
+  const manifest = parseHls(`#EXTM3U
+#EXT-X-TARGETDURATION:5
+#EXTINF:5,
+1.ts
+#EXTINF:5,
+2.ts
+#EXTINF:5,
+3.ts
+#EXT-X-ENDLIST`, "https://media.example/v/index.m3u8");
+  expect(segmentRangeForTime(manifest, 15, 15)).toEqual([2, 2]);
+  expect(segmentRangeForTime(manifest, 20, 30)).toEqual([2, 2]);
+  expect(segmentRangeForTime(manifest, 14, 15)).toEqual([2, 2]);
+  expect(segmentRangeForTime(manifest, 4, 11)).toEqual([0, 2]);
+});
+
 test("filters resource list with validation", () => {
   const items = [{ id: "a", url: "https://example/video.mp4", type: "video", size: 20 * 1024 * 1024 }];
   expect(filterCandidates(items, "video", "video", "10", "30").items).toHaveLength(1);

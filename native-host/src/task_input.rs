@@ -218,9 +218,11 @@ pub(crate) fn hls_plan(payload: &Value) -> Result<Option<HlsPlan>, &'static str>
         .ok_or("hls_plan_invalid")?
         .iter()
         .map(|item| {
+            // The merge stage always writes WebVTT (-c:s webvtt); srt/ass were accepted
+            // here but could never be produced, so reject them up front.
             let extension = item["extension"]
                 .as_str()
-                .filter(|value| matches!(*value, "vtt" | "srt" | "ass"))
+                .filter(|value| *value == "vtt")
                 .ok_or("hls_plan_invalid")?
                 .to_string();
             Ok(HlsSubtitlePlan {

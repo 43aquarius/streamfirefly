@@ -74,6 +74,28 @@ function absolute(value: string, baseUrl: string): string {
   return new URL(value, baseUrl).href;
 }
 
+/**
+ * Normalizes an `#EXT-X-BYTERANGE` value to the explicit `n@o` form. An implicit offset
+ * continues the previous sub-range of the same resource (starting at 0 for the first
+ * one), so a derived playlist never begins with a dangling offset-less range that the
+ * native host would reject with `hls_byte_range_offset_missing`.
+ */
+function normalizeByteRange(raw: string, uri: string, offsets: Map<string, number>): string {
+  const separator = raw.indexOf("@");
+  const length = Number.parseInt(separator >= 0 ? raw.slice(0, separator) : raw, 10);
+  if (!Number.isFinite(length) || length <= 0) return raw;
+  let start: number;
+  if (separator >= 0) {
+    const explicit = Number.parseInt(raw.slice(separator + 1), 10);
+    if (!Number.isFinite(explicit) || explicit < 0) return raw;
+    start = explicit;
+  } else {
+    start = offsets.get(uri) ?? 0;
+  }
+  offsets.set(uri, start + length);
+  return `${length}@${start}`;
+}
+
 export function parseAttributes(input: string): Record<string, string> {
   const values: Record<string, string> = {};
   let cursor = 0;
@@ -118,6 +140,8 @@ export function parseHls(text: string, baseUrl: string): HlsManifest {
   let timeline = 0;
   let hasLowLatencyParts = false;
   let hasDrmKeyFormat = false;
+  const segmentRangeOffsets = new Map<string, number>();
+  const mapRangeOffsets = new Map<string, number>();
   for (const line of lines) {
     if (line.startsWith("#EXT-X-STREAM-INF:")) { pendingVariant = parseAttributes(line.slice(line.indexOf(":") + 1)); continue; }
     if (line.startsWith("#EXT-X-MEDIA:")) {
@@ -131,7 +155,7 @@ export function parseHls(text: string, baseUrl: string): HlsManifest {
     if (line.startsWith("#EXT-X-TARGETDURATION:")) { targetDuration = Number.parseFloat(line.slice(line.indexOf(":") + 1)) || null; continue; }
     if (line.startsWith("#EXT-X-KEY:")) { const item = parseAttributes(line.slice(line.indexOf(":") + 1)); const keyFormat = item.KEYFORMAT || null; if (keyFormat && keyFormat !== "identity") hasDrmKeyFormat = true; currentKey = { method: item.METHOD || "NONE", uri: item.URI ? absolute(item.URI, baseUrl) : null, iv: item.IV || null, keyFormat }; continue; }
     if (line.startsWith("#EXT-X-PART:") || line.startsWith("#EXT-X-PRELOAD-HINT:")) { hasLowLatencyParts = true; continue; }
-    if (line.startsWith("#EXT-X-MAP:")) { const item = parseAttributes(line.slice(line.indexOf(":") + 1)); if (item.URI) initMap = { uri: absolute(item.URI, baseUrl), byteRange: item.BYTERANGE || null }; continue; }
+    if (line.startsWith("#EXT-X-MAP:")) { const item = parseAttributes(line.slice(line.indexOf(":") + 1)); if (item.URI) { const mapUri = absolute(item.URI, baseUrl); initMap = { uri: mapUri, byteRange: item.BYTERANGE ? normalizeByteRange(item.BYTERANGE, mapUri, mapRangeOffsets) : null }; } continue; }
     if (line === "#EXT-X-DISCONTINUITY") { discontinuity = true; continue; }
     if (line === "#EXT-X-ENDLIST") { endList = true; continue; }
     if (line.startsWith("#")) continue;
@@ -142,7 +166,9 @@ export function parseHls(text: string, baseUrl: string): HlsManifest {
       continue;
     }
     const duration = Number.isFinite(pendingDuration) ? Math.max(0, pendingDuration as number) : 0;
-    segments.push({ index: segments.length, sequence: mediaSequence + segments.length, uri: absolute(line, baseUrl), duration, title: pendingTitle, byteRange: pendingByteRange, key: currentKey, initMap, discontinuity, start: timeline, end: timeline + duration });
+    const segmentUri = absolute(line, baseUrl);
+    const byteRange = pendingByteRange != null ? normalizeByteRange(pendingByteRange, segmentUri, segmentRangeOffsets) : null;
+    segments.push({ index: segments.length, sequence: mediaSequence + segments.length, uri: segmentUri, duration, title: pendingTitle, byteRange, key: currentKey, initMap, discontinuity, start: timeline, end: timeline + duration });
     timeline += duration;
     pendingDuration = null; pendingTitle = ""; pendingByteRange = null; discontinuity = false;
   }
@@ -169,8 +195,11 @@ export function segmentRangeForTime(manifest: HlsManifest, start: number, end: n
   const safeStart = Math.max(0, Math.min(start, manifest.duration));
   const safeEnd = Math.max(safeStart, Math.min(end, manifest.duration));
   const first = manifest.segments.findIndex(segment => segment.end > safeStart);
+  // A start at or past the end of the playlist selects the final segment,
+  // not (through findIndex's -1) the entire video.
+  const from = first < 0 ? manifest.segments.length - 1 : first;
   const last = manifest.segments.findLastIndex(segment => segment.start < safeEnd || safeEnd === safeStart && segment.start <= safeEnd);
-  return [Math.max(0, first), Math.max(Math.max(0, first), last < 0 ? manifest.segments.length - 1 : last)];
+  return [from, Math.max(from, last < 0 ? manifest.segments.length - 1 : last)];
 }
 
 function quote(value: string): string { return `"${value.replaceAll('"', "%22")}"`; }

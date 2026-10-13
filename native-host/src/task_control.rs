@@ -149,19 +149,27 @@ pub(crate) fn task_control(
             }
             store.stops.lock().unwrap().insert(id.into());
             let needs_restart = matches!(task.state.as_str(), "paused" | "interrupted");
-            if needs_restart {
+            // Load the checkpoint before announcing "stopping": no control action accepts
+            // that state, so a task must never get stuck in it when the checkpoint is gone.
+            let restart_checkpoint = if needs_restart {
                 clear_pause(store, id);
                 clear_cancellation(store, id);
-            }
+                Some(
+                    load_checkpoint(&checkpoint_path_for_state(&store.repository.path, id))
+                        .map_err(|_| {
+                            clear_stop(store, id);
+                            "hls_checkpoint_missing"
+                        })?,
+                )
+            } else {
+                None
+            };
             update(store, writer, id, |current| {
                 current.state = "stopping".into();
                 current.phase = "stopping".into();
                 current.message = Some("正在停止录制并保存已下载内容".into());
             });
-            if needs_restart {
-                let checkpoint =
-                    load_checkpoint(&checkpoint_path_for_state(&store.repository.path, id))
-                        .map_err(|_| "hls_checkpoint_missing")?;
+            if let Some(checkpoint) = restart_checkpoint {
                 let mut resumed = task.clone();
                 resumed.state = "stopping".into();
                 resumed.hls_plan = Some(runtime_plan_from_persisted(&checkpoint.plan));

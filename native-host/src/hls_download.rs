@@ -640,12 +640,20 @@ fn hls_checkpoint_round(
     let runtime_plan =
         runtime_plan.unwrap_or_else(|| runtime_plan_from_persisted(&checkpoint.plan));
     let key_override = runtime_plan.key_override.clone();
-    if task.requires_authorization
+    let stopping = stop_requested(&store, &task.id);
+    let authorization_required = task.requires_authorization
         && task
             .request_headers
             .keys()
-            .all(|name| !is_sensitive_request_header(name))
-    {
+            .all(|name| !is_sensitive_request_header(name));
+    let key_required = task.requires_key_override && key_override.is_none();
+    if (authorization_required || key_required) && stopping {
+        // The user has asked to stop and save. Merging is a local FFmpeg operation that does
+        // not need network credentials, so finish the recording instead of demanding
+        // authorization or a key the next round would still reject.
+        return finalize_hls_round(&store, &writer, &task, &output, checkpoint, &work_dir);
+    }
+    if authorization_required {
         update(&store, &writer, &task.id, |current| {
             current.state = "interrupted".into();
             current.phase = "authorization_required".into();
@@ -654,7 +662,7 @@ fn hls_checkpoint_round(
         });
         return None;
     }
-    if task.requires_key_override && key_override.is_none() {
+    if key_required {
         update(&store, &writer, &task.id, |current| {
             current.state = "interrupted".into();
             current.phase = "key_required".into();
@@ -664,8 +672,14 @@ fn hls_checkpoint_round(
         return None;
     }
     let mut checkpoint = checkpoint;
-    if task.live_recording && !stop_requested(&store, &task.id) {
+    if task.live_recording && !stopping {
         if let Err(error) = refresh_live_checkpoint(&store, &task, &mut checkpoint, &work_dir) {
+            // A cancellation that lands while the live manifest is being refreshed must be
+            // honored instead of being mistaken for a refresh failure.
+            if error == "cancelled" {
+                mark_stopped(&store, &writer, &task.id);
+                return None;
+            }
             let authorization = authorization_error(&error);
             update(&store, &writer, &task.id, |current| {
                 current.state = if authorization {
@@ -995,6 +1009,12 @@ fn hls_checkpoint_round(
                     result
                 };
                 if let Err(error) = refreshed {
+                    // Honor a cancellation that lands during a refresh rather than
+                    // surfacing it as a recovery error.
+                    if error == "cancelled" {
+                        mark_stopped(&store, &writer, &task.id);
+                        return None;
+                    }
                     let authorization = authorization_error(&error);
                     update(&store, &writer, &task.id, |current| {
                         current.state = if authorization {
@@ -1039,11 +1059,25 @@ fn hls_checkpoint_round(
         }
     }
     let checkpoint_value = checkpoint.lock().unwrap().clone();
-    let final_video = checkpoint_value
+    finalize_hls_round(&store, &writer, &task, &output, checkpoint_value, &work_dir)
+}
+
+/// Runs the final merge for a checkpoint whose downloads are done (or stopped early)
+/// and settles the task state; never schedules another round. Shared by both the
+/// normal end-of-recording path and the stop-while-authorization-or-key-required path.
+fn finalize_hls_round(
+    store: &TaskRuntime,
+    writer: &Writer,
+    task: &Task,
+    output: &str,
+    checkpoint: HlsCheckpoint,
+    work_dir: &Path,
+) -> Option<(Task, Option<HlsPlan>)> {
+    let final_video = checkpoint
         .tracks
         .iter()
         .find(|track| track.kind == "video");
-    update(&store, &writer, &task.id, |current| {
+    update(store, writer, &task.id, |current| {
         current.phase = "merging".into();
         current.active_connections = 0;
         current.progress = 90;
@@ -1055,24 +1089,16 @@ fn hls_checkpoint_round(
         }
         current.message = Some("切片下载完成，正在合并".into());
     });
-    let publication = match HlsPublication::begin(&store, Some(&writer), &task.id) {
+    let publication = match HlsPublication::begin(store, Some(writer), &task.id) {
         Ok(publication) => publication,
         Err(_) => return None,
     };
-    match merge_hls_checkpoint(
-        &store,
-        &writer,
-        &task,
-        &output,
-        &checkpoint_value,
-        &work_dir,
-        &publication,
-    ) {
+    match merge_hls_checkpoint(store, writer, task, output, &checkpoint, work_dir, &publication) {
         Ok(0) => {
-            let _ = publication.finish(&work_dir);
-            clear_stop(&store, &task.id);
+            let _ = publication.finish(work_dir);
+            clear_stop(store, &task.id);
         }
-        Ok(subtitle_failures) => update(&store, &writer, &task.id, |current| {
+        Ok(subtitle_failures) => update(store, writer, &task.id, |current| {
             let conflict = current.outputs.iter().any(|output| {
                 output.kind == "subtitle" && output.error.as_deref() == Some("output_path_conflict")
             });
@@ -1096,8 +1122,8 @@ fn hls_checkpoint_round(
                 format!("视频已完成，{subtitle_failures} 条字幕生成失败，可重试")
             });
         }),
-        Err(error) if error == "cancelled" => mark_stopped(&store, &writer, &task.id),
-        Err(error) => update(&store, &writer, &task.id, |current| {
+        Err(error) if error == "cancelled" => mark_stopped(store, writer, &task.id),
+        Err(error) => update(store, writer, &task.id, |current| {
             current.state = "failed".into();
             current.phase = "failed".into();
             current.error = Some(error.clone());

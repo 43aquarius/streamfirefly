@@ -81,6 +81,10 @@ async function loadVariant() {
     resetRange();
     const preferred = defaultAudio(master.value?.tracks || [], variant.audioGroup);
     selectedAudioId.value = preferred?.id || "";
+    // Each variant can reference its own subtitle group; drop selections that the new
+    // variant cannot provide so a stale id never reaches createTask's lookup.
+    const subtitleGroup = variant.subtitlesGroup;
+    selectedSubtitleIds.value = selectedSubtitleIds.value.filter(id => (master.value?.tracks || []).some(item => item.type === "SUBTITLES" && item.id === id && item.uri && (!subtitleGroup || item.groupId === subtitleGroup)));
     form.container = chooseHlsContainer(variant.codecs);
     form.extension = form.container;
   } catch (reason: any) { if (!disposed && sequence === variantSequence) error.value = humanError(reason?.message); }
@@ -117,13 +121,13 @@ async function initialize() {
       resetRange();
     }
     const prepared: any = await sendMessage({ type: "task.prepare", payload: basePayload() }).catch(() => null);
-    form.name = prepared?.payload?.fileName || props.candidate.pageTitle || "streamfirefly-media";
+    form.name = prepared?.payload?.fileName || props.candidate.pageTitle || "";
   } catch (reason: any) { error.value = humanError(reason?.message); }
   finally { loading.value = false; }
 }
 
 function basePayload() {
-  return { url: props.candidate.url, candidateId: props.candidate.id, title: props.candidate.title || props.candidate.pageTitle || "streamfirefly-media", pageTitle: props.candidate.pageTitle || null, pageUrl: props.candidate.pageUrl || null, mime: props.candidate.mime || "application/vnd.apple.mpegurl", referer: props.candidate.referer || props.candidate.pageUrl || null, requestHeaders: props.candidate.requestHeaders || {}, downloadThreads: props.downloadThreads, sourceContextId: props.context.sourceContextId };
+  return { url: props.candidate.url, candidateId: props.candidate.id, title: props.candidate.title || props.candidate.pageTitle || null, pageTitle: props.candidate.pageTitle || null, pageUrl: props.candidate.pageUrl || null, mime: props.candidate.mime || "application/vnd.apple.mpegurl", referer: props.candidate.referer || props.candidate.pageUrl || null, requestHeaders: props.candidate.requestHeaders || {}, downloadThreads: props.downloadThreads, sourceContextId: props.context.sourceContextId };
 }
 
 async function createTask() {
@@ -136,10 +140,10 @@ async function createTask() {
   try {
     const audio = audioTracks.value.find(item => item.id === selectedAudioId.value);
     const audioManifest = audio ? await loadTrack(audio) : null;
-    const subtitles = await Promise.all(selectedSubtitleIds.value.map(async id => {
-      const track = subtitleTracks.value.find(item => item.id === id)!;
-      return { id: track.id, language: track.language || null, label: track.name, manifest: await loadTrack(track) };
-    }));
+    const selectedTracks = selectedSubtitleIds.value
+      .map(id => subtitleTracks.value.find(item => item.id === id))
+      .filter((track): track is HlsTrack => Boolean(track));
+    const subtitles = await Promise.all(selectedTracks.map(async track => ({ id: track.id, language: track.language || null, label: track.name, manifest: await loadTrack(track) })));
     const hlsPlan = await buildHlsPlan({ video: videoManifest.value, audio: audioManifest, subtitles, container: form.container, first: actualRange.value?.first, last: actualRange.value?.last, requestedStart: range.startTime, requestedEnd: range.endTime, keyOverride: keyMode.value === "manual" ? { kind: keyForm.kind, value: keyForm.value.trim(), iv: keyForm.iv.trim() || null } : null });
     const task = await createDownload({ ...basePayload(), fileName: form.name.trim(), saveDir: props.saveDir || null, hlsPlan }, requestId.value);
     const result = { task };

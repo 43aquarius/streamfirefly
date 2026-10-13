@@ -67,7 +67,12 @@ export function createSniffing(api, settings) {
       const windowId = workspace ? port.sender?.tab?.windowId : message.windowId;
       if (!Number.isInteger(windowId) || workspace && !Number.isInteger(tabId) || !workspace && port.sender?.url?.split(/[?#]/, 1)[0] !== api.runtime.getURL("dist/app.html")) return;
       leases.set(port, { surface: message.surface, windowId, tabId });
-      refresh().then(() => port.postMessage({ ready: true }), () => port.postMessage({ ready: false }));
+      // The port may disconnect while the queued refresh is still running; posting to a
+      // disconnected port throws, so guard both settle paths.
+      refresh().then(
+        () => { try { port.postMessage({ ready: true }); } catch (_) {} },
+        () => { try { port.postMessage({ ready: false }); } catch (_) {} }
+      );
     });
     port.onDisconnect.addListener(() => { if (leases.delete(port)) void refresh(); });
   });

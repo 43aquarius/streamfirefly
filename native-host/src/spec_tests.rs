@@ -255,6 +255,17 @@ fn page_title_naming_combines_title_with_informative_server_names() {
     assert_eq!(name(legacy), "30080", "older extensions without namingMode keep the original behaviour");
 }
 #[test]
+fn page_title_naming_falls_back_when_no_title_exists() {
+    // Candidates without a page title must not invent one: the server file name and
+    // the URL name take over instead of a placeholder like "streamfirefly-download".
+    let name = |payload: Value| prepare_task(&payload).unwrap()["fileName"].clone();
+    let base = json!({"url":"https://cdn.test/30080.m4s?sign=1","mime":"video/mp4","namingMode":"page_title"});
+    assert_eq!(name(base.clone()), "30080");
+    let mut with_server = base;
+    with_server["contentDisposition"] = json!("attachment; filename=lecture-03.mp4");
+    assert_eq!(name(with_server), "lecture-03");
+}
+#[test]
 fn site_subdirectory_accepts_only_one_safe_folder_name() {
     let folder = |value: Value| site_subdirectory(&json!({"subdirectory":value}));
     assert_eq!(folder(json!("bilibili.com")), Some("bilibili.com".into()));
@@ -391,6 +402,18 @@ fn hls_plan_validates_version_duration_container_and_subtitle_limit() {
         hls_plan(&excessive).unwrap_err(),
         "hls_plan_too_many_subtitles"
     );
+}
+#[test]
+fn hls_plan_only_accepts_webvtt_subtitles() {
+    // The merge stage always writes WebVTT; srt/ass extensions used to pass validation
+    // but could never be produced, failing later inside FFmpeg instead.
+    let mut payload = hls_payload(None);
+    payload["hlsPlan"]["subtitles"][0]["extension"] = json!("srt");
+    assert_eq!(hls_plan(&payload).unwrap_err(), "hls_plan_invalid");
+    payload["hlsPlan"]["subtitles"][0]["extension"] = json!("ass");
+    assert_eq!(hls_plan(&payload).unwrap_err(), "hls_plan_invalid");
+    payload["hlsPlan"]["subtitles"][0]["extension"] = json!("vtt");
+    assert_eq!(hls_plan(&payload).unwrap().unwrap().subtitles.len(), 2);
 }
 #[test]
 fn hls_plan_v2_accepts_valid_key_override_and_v1_rejects_it() {

@@ -1,4 +1,4 @@
-import { buildHlsPlan, prepareDefaultDownload } from "./download-plan";
+import { buildHlsPlan, candidatePayload, prepareDefaultDownload } from "./download-plan";
 import { parseHls } from "./media";
 
 const url = "https://media.example/video.m3u8";
@@ -23,5 +23,14 @@ describe("shared download plans", () => {
     const encrypted = text.replace("#EXTINF", '#EXT-X-KEY:METHOD=SAMPLE-AES,URI="key"\n#EXTINF');
     await expect(buildHlsPlan({ video: parseHls(encrypted, url), container: "mp4" })).rejects.toThrow("SAMPLE-AES");
     await expect(buildHlsPlan({ video: parseHls(text, url), audio: parseHls(encrypted, url), container: "mp4" })).rejects.toThrow("SAMPLE-AES");
+  });
+
+  it("does not invent a title for untitled candidates", () => {
+    // A placeholder title would win over the server file name and the URL name in
+    // page-title naming; untitled candidates must carry null so the native fallbacks run.
+    const untitled = { id: "video", type: "video", url: "https://example.test/movie.mp4" };
+    expect(candidatePayload(untitled).title).toBeNull();
+    expect(candidatePayload({ ...untitled, title: "电影" }).title).toBe("电影");
+    expect(candidatePayload({ ...untitled, pageTitle: "页面标题" }).title).toBe("页面标题");
   });
 });
