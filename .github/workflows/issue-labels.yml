@@ -1,0 +1,62 @@
+name: Issue labels
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: issue-labels-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  label:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Label from the issue form
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+          BODY: ${{ github.event.issue.body }}
+          PREVIOUS_BODY: ${{ github.event.changes.body.from }}
+        run: |
+          $maps = @{
+            '问题类型' = @{
+              '识别不到资源' = '识别'
+              '下载失败或下载结果不对' = '下载'
+              'HLS / DASH 解析' = 'HLS/DASH'
+              '缓存捕捉 / 直播录制' = '缓存捕捉'
+              '本地助手安装或连接' = '本地助手'
+              '界面显示或操作' = '界面'
+            }
+            '发行版' = @{
+              '通用版（Chrome / Edge）' = 'Chrome/Edge'
+              '通用版（Firefox）' = 'Firefox'
+              'Chrome 应用商店版' = '商店版'
+              '从源码构建' = '源码构建'
+            }
+          }
+          function Get-Labels([string]$body) {
+            $labels = @()
+            if (-not $body) { return $labels }
+            # Issue forms render each field as "### <label>", a blank line, then the chosen value.
+            $field = { param($title) if ($body -match "(?m)^### $([regex]::Escape($title))\r?\n\r?\n(.+?)\r?$") { $Matches[1].Trim() } }
+            foreach ($title in $maps.Keys) { $value = & $field $title; if ($value -and $maps[$title].ContainsKey($value)) { $labels += $maps[$title][$value] } }
+            $ai = & $field 'AI 使用说明 / AI disclosure'
+            if ($ai -and $ai -ne '没有使用 AI' -and $ai -ne '_No response_') { $labels += 'AI 辅助' }
+            if ($ai -like '*还没有自己确认*') { $labels += '待确认' }
+            return $labels
+          }
+          $wanted = @(Get-Labels $env:BODY)
+          # Only remove labels the previous form answers produced, so labels added by hand stay.
+          $stale = @(Get-Labels $env:PREVIOUS_BODY | Where-Object { $_ -notin $wanted })
+          "Add: $($wanted -join ', ')"; "Remove: $($stale -join ', ')"
+          $arguments = @('issue', 'edit', $env:NUMBER)
+          if ($wanted.Count) { $arguments += @('--add-label', ($wanted -join ',')) }
+          if ($stale.Count) { $arguments += @('--remove-label', ($stale -join ',')) }
+          if ($arguments.Count -gt 3) { gh @arguments; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
