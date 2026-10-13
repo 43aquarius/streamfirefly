@@ -29,7 +29,7 @@ English contributions are welcome. Please follow the same rules below.
   npm run test:native
   ```
 
-- 在 PR 说明里写清楚改了什么、为什么改，以及实际运行了哪些命令。
+- 按 PR 模板填写改了什么、为什么改、实际运行了哪些命令，以及 AI 使用说明。
 
 ## 依赖升级
 
@@ -38,9 +38,16 @@ English contributions are welcome. Please follow the same rules below.
 - 不要用 `overrides` 单独覆盖某个子包。同一组的包要一起升级，例如 `vue` 和全部 `@vue/*`。
 - 升级后跑完上面的检查命令。
 
-## 自动化工具和 AI 生成的 PR
+## 使用 AI 的说明
 
-可以用工具辅助，但提交人必须自己读过改动、在本地验证过，并在 PR 说明里写明验证方式。没有验证过的自动化 PR 会直接关闭。
+可以用 AI 辅助写代码、查问题或整理文字，但提 issue 和 PR 时必须如实说明：
+
+- 写明有没有用 AI。用了的话，写出具体的工具和模型版本，例如 `chatgpt-6.1-sol`，不要只写“AI”或“ChatGPT”；再写明用在了哪里，比如发现问题、写代码、写测试、写说明。issue 表单和 PR 模板里都有对应的位置。
+- AI 发现的问题，提交前请自己确认能复现，或者能在代码里指出具体位置；还没有确认的，请注明。
+- AI 写的代码，提交人必须自己读过全部改动、在本地验证过，并在 PR 里写明验证方式。
+- 没有如实说明，或者没有验证过的自动化 PR，会直接关闭。
+
+AI tools are welcome, but disclose them: name the exact tool and model version (for example `chatgpt-6.1-sol`) and what it was used for. Undisclosed or unverified AI-generated PRs will be closed.
 
 ## 不接受的改动
 

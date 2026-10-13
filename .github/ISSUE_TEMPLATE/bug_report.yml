@@ -23,6 +23,26 @@ body:
           required: true
 
   - type: dropdown
+    id: ai_usage
+    attributes:
+      label: AI 使用说明 / AI disclosure
+      description: 写这个 issue 时有没有借助 AI。用了也没关系，如实说明即可，见 [CONTRIBUTING.md](https://github.com/rumoii/streamfirefly/blob/main/CONTRIBUTING.md#使用-ai-的说明)。
+      options:
+        - 没有使用 AI
+        - 只用 AI 整理或翻译文字，问题是我自己遇到的
+        - 问题由 AI 发现或分析（例如 AI 代码审查），我已自己确认过
+        - 问题由 AI 发现或分析，我还没有自己确认
+    validations:
+      required: true
+
+  - type: input
+    id: ai_model
+    attributes:
+      label: 使用的 AI 工具和模型
+      description: 用了 AI 就必须填，写具体型号和版本，不要只写“AI”。
+      placeholder: chatgpt-6.1-sol
+
+  - type: dropdown
     id: edition
     attributes:
       label: 发行版
