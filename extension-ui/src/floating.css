@@ -59,7 +59,7 @@
 
 @container floating (max-width: 899px) {
   .floating-window .parser-grid, .floating-window .download-summary, .floating-window .key-form, .floating-window .resume-key-form, .floating-window .dash-selection { grid-template-columns: 1fr; }
-  .floating-window .settings-layout { grid-template-columns: 1fr; }
+  .floating-window .settings-layout { grid-template-columns: 1fr; min-height: 0; }
   .floating-window .settings-navigation { grid-column: 1 / -1; flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--sf-border); border-radius: var(--sf-radius-lg) var(--sf-radius-lg) 0 0; }
   .floating-window .settings-footer { border-radius: 0 0 var(--sf-radius-lg) var(--sf-radius-lg); }
   .floating-window .settings-field-row { grid-template-columns: 1fr; }
