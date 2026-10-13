@@ -89,6 +89,9 @@ fn webm(data: &[u8]) -> Inspection {
     while offset < data.len() {
         let Some((id, start, end)) = element(data, offset) else { break };
         if id == 0x1f43b675 { result.media = data.len() > start; break; }
+        // A page that sends its initialization again (after the one captured from the page) starts
+        // a new EBML header and Segment; read into that Segment instead of skipping its whole body.
+        if id == 0x18538067 { offset = start; continue; }
         let Some(end) = end else { break };
         if segment_end.is_some_and(|limit| end > limit) { break; }
         let Some(body) = data.get(start..end) else { break };
@@ -134,5 +137,16 @@ mod tests {
         for length in 0..init.len() { assert!(!inspect(&init[..length], "audio/webm", length as u64).initialized); }
         let media = [init.as_slice(), &[0x1f,0x43,0xb6,0x75,0xff,0xe7,0x81,0]].concat();
         assert!(inspect(&media, "audio/webm", media.len() as u64).media);
+    }
+    #[test]
+    fn webm_reads_into_a_repeated_initialization_segment() {
+        let header = [0x1a,0x45,0xdf,0xa3,0x84,0x42,0x86,0x81,1];
+        let body = [0x15,0x49,0xa9,0x66,0x84,0x2a,0xd7,0xb1,0x80,0x16,0x54,0xae,0x6b,0x85,0xae,0x83,0xd7,0x81,1];
+        let captured = [header.as_slice(), &[0x18,0x53,0x80,0x67,0xff], &body].concat();
+        // The page's own initialization declares a Segment that runs far past the inspected prefix.
+        let resent = [header.as_slice(), &[0x18,0x53,0x80,0x67,0x01,0,0,0,0x01,0xfc,0xa0,0], &body].concat();
+        let media = [captured, resent, vec![0x1f,0x43,0xb6,0x75,0xff,0xe7,0x81,0]].concat();
+        let inspection = inspect(&media, "video/webm", media.len() as u64);
+        assert!(inspection.initialized && inspection.media);
     }
 }
