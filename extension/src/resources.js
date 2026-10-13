@@ -410,7 +410,8 @@ async function readBoundedText(response, maxBytes) {
   }
 }
 
-async function fetchMediaText(tabId, id, requestedUrl) {
+/** Resolves a candidate-owned http(s) request with the page's Referer, Origin and Authorization. */
+async function prepareOwnedFetch(tabId, id, requestedUrl) {
   const candidate = await candidateFor(tabId, id);
   const owner = Array.isArray(candidate) ? null : candidate;
   if (!owner) return { ok: false, error: "media_candidate_not_found" };
@@ -428,6 +429,13 @@ async function fetchMediaText(tabId, id, requestedUrl) {
     else if (["origin", "referer"].includes(key)) pageHeaders[key] = value;
   }
   if (!pageHeaders.referer && /^https?:/i.test(owner.referer || owner.pageUrl || "")) pageHeaders.referer = owner.referer || owner.pageUrl;
+  return { ok: true, owner, url, headers, pageHeaders };
+}
+
+async function fetchMediaText(tabId, id, requestedUrl) {
+  const prepared = await prepareOwnedFetch(tabId, id, requestedUrl);
+  if (!prepared.ok) return prepared;
+  const { url, headers, pageHeaders } = prepared;
   // Fetch drops Referer and Origin as forbidden headers, so a short-lived session rule supplies them.
   const removeRule = await applyFetchHeaders(url, pageHeaders);
   try {
@@ -438,6 +446,51 @@ async function fetchMediaText(tabId, id, requestedUrl) {
     catch (error) { return { ok: false, error: error.message === "media_manifest_too_large" ? error.message : "media_fetch_failed" }; }
     return { ok: true, url: response.url || url.href, text };
   } finally { await removeRule(); }
+}
+
+/**
+ * Reads the total size of a file the browser never requested itself (for example an mp4
+ * address found in a page's JSON), using a one-byte range request. A size from a real
+ * network response always wins over this probe.
+ */
+async function probeMediaSize(tabId, sourceContextId, id) {
+  const inactive = state => !sourceContextId || sourceContextId !== state.sourceContextId ? { ok: false, error: "media_context_stale" } : state.paused || !sniffing.allowed(tabId) ? { ok: false, error: "sniffing_inactive" } : null;
+  const refused = inactive(await loadTabState(tabId));
+  if (refused) return refused;
+  const prepared = await prepareOwnedFetch(tabId, id);
+  if (!prepared.ok) return prepared;
+  const { owner, url, headers, pageHeaders } = prepared;
+  if (!["video", "audio"].includes(owner.type)) return { ok: false, error: "media_size_unsupported" };
+  if (owner.size > 0) return { ok: true, candidate: owner };
+  headers.set("Range", "bytes=0-0");
+  const removeRule = await applyFetchHeaders(url, pageHeaders);
+  let size = null;
+  try {
+    const response = await fetch(url.href, { headers, credentials: "include", redirect: "follow", signal: AbortSignal.timeout(10000) });
+    const length = Number(response.headers.get("content-length"));
+    // An expired address often redirects to a login or error page; its length is not the media size.
+    const page = /^(?:text\/html|application\/(?:json|xhtml\+xml))/i.test(response.headers.get("content-type") || "") || blockedSite(response.url || url.href);
+    size = page ? null : response.status === 206 ? parseContentRange(response.headers.get("content-range")) : response.ok && Number.isFinite(length) && length > 0 ? length : null;
+    // A server that ignores Range answers with the whole file; stop reading it.
+    response.body?.cancel?.()?.catch?.(() => {});
+  } catch (_) {
+    return { ok: false, error: "media_fetch_failed" };
+  } finally { await removeRule(); }
+  if (!size) return { ok: false, error: "media_size_unavailable" };
+  return queueTab(tabId, async () => {
+    const state = await loadTabState(tabId);
+    const stale = inactive(state);
+    if (stale) return stale;
+    const existing = state.candidates.get(owner.id);
+    if (!existing) return { ok: false, error: "media_candidate_not_found" };
+    if (existing.size > 0) return { ok: true, candidate: existing };
+    const candidate = { ...existing, size, sizeSource: "probe" };
+    state.candidates.set(owner.id, candidate);
+    state.lastTouchedAt = Date.now();
+    schedulePersist(state);
+    notifyUiContext(tabId);
+    return { ok: true, candidate };
+  });
 }
 
 let nextFetchRuleId = 2146000000;
@@ -473,5 +526,5 @@ async function clearExtracted() {
     updateBadge(state); notifyUiContext(tabId);
   });
 }
-return { refreshBadgeForContext, subscribeCandidates(listener) { candidateListeners.add(listener); return () => candidateListeners.delete(listener); }, clearExtracted, reevaluate, loadTabState, uiContextForTab, resolveUiTab, notifyUiContext, queueTab, rememberRequestContext, parseContentRange, addCandidate, clearTab, resolveRequestTabId, setSniffingPaused, patchResourceViewState, updateCandidateMetadata, removeCandidates, candidateFor, fetchMediaText };
+return { refreshBadgeForContext, subscribeCandidates(listener) { candidateListeners.add(listener); return () => candidateListeners.delete(listener); }, clearExtracted, reevaluate, loadTabState, uiContextForTab, resolveUiTab, notifyUiContext, queueTab, rememberRequestContext, parseContentRange, addCandidate, clearTab, resolveRequestTabId, setSniffingPaused, patchResourceViewState, updateCandidateMetadata, removeCandidates, candidateFor, fetchMediaText, probeMediaSize };
 }

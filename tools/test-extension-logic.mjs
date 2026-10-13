@@ -34,6 +34,7 @@ const tabsById = new Map([
   [8, { id: 8, active: false, url: 'https://video.example/page', title: '媒体页面 B', lastAccessed: 1, windowId: 1 }],
   [9, { id: 9, active: false, url: 'chrome://extensions', title: '扩展程序', lastAccessed: 0, windowId: 1 }]
 ]);
+const fetchCalls = [];
 let fetchResponse = new Response('#EXTM3U\n#EXTINF:2,\nsegment.ts\n', { headers: { 'content-type': 'application/vnd.apple.mpegurl' } });
 const storageArea = (values, queries = null) => ({
   async get(query) {
@@ -114,7 +115,7 @@ class FixtureWorker {
   postMessage(job) { queueMicrotask(() => { if (!this.stopped) this.scope.self.onmessage({ data: structuredClone(job) }); }); }
   terminate() { this.stopped = true; }
 }
-vm.runInNewContext(source, { chrome: api, Worker: FixtureWorker, Error, URL, URLSearchParams, Map, Set, Number, Object, Date, Promise, TextEncoder, TextDecoder, Headers, Uint8Array, crypto: webcrypto, structuredClone, fetch: async () => fetchResponse, setTimeout, clearTimeout, console });
+vm.runInNewContext(source, { chrome: api, Worker: FixtureWorker, Error, URL, URLSearchParams, Map, Set, Number, Object, Date, Promise, TextEncoder, TextDecoder, Headers, Uint8Array, AbortSignal, crypto: webcrypto, structuredClone, fetch: async (url, init) => { fetchCalls.push({ url, init }); return fetchResponse; }, setTimeout, clearTimeout, console });
 
 const settle = () => new Promise(resolve => setImmediate(resolve));
 const flush = async () => { for (let index = 0; index < 6; index += 1) await settle(); };
@@ -262,6 +263,37 @@ if (oversizedManifest.ok || oversizedManifest.error !== 'media_manifest_too_larg
 
 const metadata = await send({ type: 'media.metadata.update', tabId: 7, sourceContextId: (await send({ type: 'ui.context.get', scope: 'active' })).context.sourceContextId, payload: { id: inline.id, url: inline.url, duration: 18.5, width: 1280, height: 720, live: false } });
 if (!metadata.ok || metadata.candidate.duration !== 18.5 || metadata.candidate.width !== 1280 || metadata.candidate.height !== 720) throw new Error(`Preview metadata was not merged: ${JSON.stringify(metadata)}`);
+
+const probeContextId = (await send({ type: 'ui.context.get', scope: 'active' })).context.sourceContextId;
+const clip = candidates.find(item => item.url.endsWith('/clip.ogv'));
+fetchResponse = new Response('x', { status: 206, headers: { 'content-range': 'bytes 0-0/52428800' } });
+const rangedSize = await send({ type: 'media.size.probe', tabId: 7, sourceContextId: probeContextId, id: clip.id });
+if (!rangedSize.ok || rangedSize.candidate.size !== 52428800 || rangedSize.candidate.sizeSource !== 'probe') throw new Error(`Range size probe failed: ${JSON.stringify(rangedSize)}`);
+if (new Headers(fetchCalls.at(-1).init.headers).get('range') !== 'bytes=0-0') throw new Error('Size probe did not request a single byte');
+await send({ type: 'media.add', candidate: { url: 'https://media.example/watch/full.mp4', mime: '', source: 'xhr-json' } }, { tab: { id: 7 } });
+fetchResponse = new Response('abc', { status: 200, headers: { 'content-length': '3000' } });
+const wholeSize = await send({ type: 'media.size.probe', tabId: 7, sourceContextId: probeContextId, id: 'https://media.example/watch/full.mp4' });
+if (!wholeSize.ok || wholeSize.candidate.size !== 3000) throw new Error(`Content-Length size probe failed: ${JSON.stringify(wholeSize)}`);
+await send({ type: 'media.add', candidate: { url: 'https://media.example/watch/missing.mp4', mime: '', source: 'xhr-json' } }, { tab: { id: 7 } });
+fetchResponse = new Response('gone', { status: 404 });
+const missingSize = await send({ type: 'media.size.probe', tabId: 7, sourceContextId: probeContextId, id: 'https://media.example/watch/missing.mp4' });
+if (missingSize.ok || (await send({ type: 'media.candidates', tabId: 7 })).find(item => item.url.endsWith('/missing.mp4')).size) throw new Error(`Failed size probe wrote a size: ${JSON.stringify(missingSize)}`);
+fetchResponse = new Response('x', { status: 206, headers: { 'content-range': 'bytes 0-0/1000' } });
+const fetchesBeforeRefused = fetchCalls.length;
+const staleSize = await send({ type: 'media.size.probe', tabId: 7, sourceContextId: 'stale-context', id: 'https://media.example/watch/missing.mp4' });
+if (staleSize.ok || staleSize.error !== 'media_context_stale') throw new Error(`Size probe accepted a stale page context: ${JSON.stringify(staleSize)}`);
+await send({ type: 'media.sniffing.set', tabId: 7, payload: { paused: true } });
+const pausedSize = await send({ type: 'media.size.probe', tabId: 7, sourceContextId: probeContextId, id: 'https://media.example/watch/missing.mp4' });
+await send({ type: 'media.sniffing.set', tabId: 7, payload: { paused: false } });
+if (pausedSize.ok || pausedSize.error !== 'sniffing_inactive' || fetchCalls.length !== fetchesBeforeRefused) throw new Error(`Size probe sent a request while refused: ${JSON.stringify(pausedSize)}`);
+fetchResponse = new Response('<html></html>', { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'content-length': '13' } });
+const loginPage = await send({ type: 'media.size.probe', tabId: 7, sourceContextId: probeContextId, id: 'https://media.example/watch/missing.mp4' });
+if (loginPage.ok || (await send({ type: 'media.candidates', tabId: 7 })).find(item => item.url.endsWith('/missing.mp4')).size) throw new Error(`A redirected HTML page was taken as the media size: ${JSON.stringify(loginPage)}`);
+const fetchesBeforeKnown = fetchCalls.length;
+const knownSize = await send({ type: 'media.size.probe', tabId: 7, sourceContextId: probeContextId, id: video.id });
+if (!knownSize.ok || knownSize.candidate.size !== 8192 || knownSize.candidate.sizeSource !== 'content-range' || fetchCalls.length !== fetchesBeforeKnown) throw new Error(`Size probe replaced a network size: ${JSON.stringify(knownSize)}`);
+await send({ type: 'media.add', candidate: { url: 'https://media.example/watch/clip.ogv', mime: 'video/ogg', size: 4096, sizeSource: 'content-length', source: 'network' } }, { tab: { id: 7 } });
+if ((await send({ type: 'media.candidates', tabId: 7 })).find(item => item.url.endsWith('/clip.ogv')).size !== 4096) throw new Error('A network size did not replace a probed size');
 
 await send({ type: 'preview.headers.apply', payload: { previewSessionId: 'preview-a', candidateId: video.id, url: video.url, headers: video.requestHeaders } }, { tab: { id: 7 } });
 if (listeners.previewRules?.addRules?.[0]?.condition?.tabIds?.[0] !== 7) throw new Error(`Preview rule was not scoped to the source tab: ${JSON.stringify(listeners.previewRules)}`);

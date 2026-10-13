@@ -16,9 +16,16 @@ export function formatDuration(value?: number | null): string {
 
 export function formatSpeed(value?: number | null): string { return Number(value) > 0 ? `${formatBytes(value)}/s` : "等待测速"; }
 
+/** Page-probe sources are composed (`xhr-json`, `fetch-body-member`, ...), so they are matched by prefix and suffix. */
 export function sourceLabel(value?: string): string {
-  const labels: Record<string, string> = { dom: "页面元素", network: "网络响应", "inline-script": "页面脚本", "fetch-body": "请求响应体", "blob-manifest": "内存清单", worker: "Worker" };
-  return labels[value || ""] || "页面脚本";
+  const source = value || "";
+  const labels: Record<string, string> = { dom: "页面元素", network: "网络响应", timing: "资源记录", rule: "提取规则", worker: "Worker", "blob-manifest": "内存清单" };
+  if (labels[source]) return labels[source];
+  if (source.endsWith("-member")) return "清单成员";
+  if (source.startsWith("inline-script") || source.startsWith("page-probe")) return "页面脚本";
+  if (source.startsWith("blob")) return "内存数据";
+  if (/^(?:fetch|xhr)(?:$|-)/.test(source)) return source === "fetch" || source === "xhr" ? "页面请求" : "请求响应体";
+  return "其他来源";
 }
 
 export function typeLabel(value?: string): string {

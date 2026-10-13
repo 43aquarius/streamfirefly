@@ -5,6 +5,7 @@ import type { DownloadTask, MediaCandidate, ResourceViewState, UiContext } from 
 import { createSettingsState } from "./features/settings/state";
 import { createDownloadsState } from "./features/downloads/state";
 import { createHlsMetadataQueue } from "./hls-metadata";
+import { createSizeProbeQueue, withProbedSize } from "./size-probe";
 
 
 
@@ -84,6 +85,7 @@ export const useAppStore = defineStore("app", () => {
     context.value = nextContext;
     candidates.value = Array.isArray(result.context?.candidates) ? result.context.candidates : [];
     hlsMetadata.schedule(nextContext.sourceContextId, candidates.value);
+    sizeProbe.schedule(nextContext.sourceContextId, candidates.value, nextContext.sniffingActive);
     if (!sameContext || (!pendingPatches && nextContext.resourceViewState.revision >= resourceViewState.value.revision)) resourceViewState.value = { ...nextContext.resourceViewState };
     error.value = "";
     if (surface.value !== "workspace") document.title = `流萤 · ${context.value?.pageTitle || "网页媒体"}`;
@@ -196,6 +198,19 @@ export const useAppStore = defineStore("app", () => {
     apply: (candidate, metadata) => updateCandidateMetadata(candidate, metadata)
   });
 
+  const sizeProbe = createSizeProbeQueue({
+    probe: async candidate => {
+      if (!context.value?.supported || !extensionApi()?.runtime?.sendMessage) return;
+      const sourceContextId = context.value.sourceContextId;
+      const result: any = await sendMessage({ type: "media.size.probe", tabId: context.value.sourceTabId, sourceContextId, id: candidate.id });
+      // The view may have moved to another tab or page while the request was out.
+      if (!result?.ok || !result.candidate || context.value?.sourceContextId !== sourceContextId) return;
+      const index = candidates.value.findIndex(item => item.id === candidate.id);
+      const updated = index >= 0 ? withProbedSize(candidates.value[index], result.candidate) : null;
+      if (updated) candidates.value[index] = updated;
+    }
+  });
+
   async function updateCandidateMetadata(candidate: MediaCandidate, metadata: Partial<Pick<MediaCandidate, "duration" | "width" | "height" | "poster" | "live">>) {
     if (!context.value?.supported) return;
     if (!extensionApi()?.runtime?.sendMessage) {
@@ -227,6 +242,7 @@ export const useAppStore = defineStore("app", () => {
     disposed = true;
     contextSequence++;
     taskState.dispose();
+    sizeProbe.stop();
     document.removeEventListener("visibilitychange", onVisibilityChange);
     if (timer != null) { clearTimeout(timer); timer = null; }
     if (reconnectTimer != null) { clearTimeout(reconnectTimer); reconnectTimer = null; }

@@ -11,6 +11,8 @@ export interface MediaCandidate {
   type: CandidateType;
   mime?: string;
   size?: number | null;
+  /** Where the size came from: "content-range", "content-length" or "probe". */
+  sizeSource?: string | null;
   sizeKind?: string;
   width?: number | null;
   height?: number | null;
