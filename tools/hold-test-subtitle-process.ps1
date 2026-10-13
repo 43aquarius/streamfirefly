@@ -21,6 +21,8 @@ public static class SubtitleBarrier {
     public static extern uint WaitForSingleObject(IntPtr process, uint milliseconds);
     [DllImport("kernel32.dll")]
     public static extern bool TerminateProcess(IntPtr process, uint exitCode);
+    [DllImport("kernel32.dll")]
+    public static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
     [DllImport("ntdll.dll")]
     public static extern int NtQueryInformationProcess(IntPtr process, int kind, out BasicInfo info, int size, out int length);
     [DllImport("ntdll.dll")]
@@ -60,8 +62,11 @@ try {
                 $null = $seen.Add($candidateId)
                 $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$candidateId" -OperationTimeoutSec 5
                 if ($processInfo.CommandLine -notmatch '\.streamfirefly-part-[^\\/"]+\.vtt') { continue }
-                # A short subtitle FFmpeg may already be exiting when suspended; hold the next one instead.
-                if ([SubtitleBarrier]::WaitForSingleObject($handle, 0) -ne 258) { continue }
+                # A short subtitle FFmpeg may already be exiting when suspended: its exit code is set before the
+                # handle signals, and the test's liveness check reads the exit code. Hold the next one instead.
+                $exitCode = [uint32]0
+                if (-not [SubtitleBarrier]::GetExitCodeProcess($handle, [ref]$exitCode) -or $exitCode -ne 259 -or
+                    [SubtitleBarrier]::WaitForSingleObject($handle, 0) -ne 258) { continue }
                 $marker = @{ pid = $candidateId; parent = $NativePid; commandLine = $processInfo.CommandLine } | ConvertTo-Json -Compress
                 [IO.File]::WriteAllText((Join-Path $ControlDirectory 'held.json'), $marker)
                 while ([DateTime]::UtcNow -lt $deadline -and -not (Test-Path -LiteralPath $stopFile) -and

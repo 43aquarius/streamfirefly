@@ -223,5 +223,5 @@ try {
   const resolved = fs.realpathSync(temporary);
   assert.equal(path.dirname(resolved), fs.realpathSync(os.tmpdir()));
   assert.ok(path.basename(resolved).startsWith('streamfirefly-capture-eof-'));
-  fs.rmSync(resolved, { recursive: true, force: true });
+  fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
