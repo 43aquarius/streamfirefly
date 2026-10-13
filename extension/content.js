@@ -64,6 +64,47 @@
       media.addEventListener("loadedmetadata", () => report(media, true), { once: true });
     }
   });
+  // The video the user is watching: one that keeps playing for a moment while mostly on screen.
+  // Only a settled play changes it, so scrolling past autoplaying previews does not reorder the list.
+  let focusTimer = 0;
+  let focusedUrl = "";
+  const visibleArea = video => {
+    const rect = video.getBoundingClientRect();
+    const width = Math.min(rect.right, innerWidth) - Math.max(rect.left, 0);
+    const height = Math.min(rect.bottom, innerHeight) - Math.max(rect.top, 0);
+    const mostlyVisible = rect.width >= 160 && rect.height >= 90 && width > 0 && height > 0 && width * height >= rect.width * rect.height * 0.5;
+    return mostlyVisible ? width * height : 0;
+  };
+  const focusable = video => video?.tagName === "VIDEO" && !video.paused && !video.ended && Boolean(video.currentSrc || video.src) && visibleArea(video) > 0;
+  const reportFocus = video => {
+    const url = video.currentSrc || video.src;
+    if (!active || url === focusedUrl) return;
+    const send = () => {
+      if (!active || url === focusedUrl) return;
+      focusedUrl = url;
+      api.runtime.sendMessage({ type: "media.focus", focus: { url, poster: video.poster || null, duration: Number.isFinite(video.duration) ? video.duration : null } }).catch?.(() => {});
+    };
+    if (window === window.top) { send(); return; }
+    // A frame only knows its own viewport; the observer's default root is the top-level page, so an
+    // off-screen embed (often an autoplaying ad) cannot take the focus from the video the user watches.
+    const observer = new IntersectionObserver(entries => {
+      observer.disconnect();
+      if ((entries[0]?.intersectionRatio || 0) >= 0.5) send();
+    });
+    observer.observe(video);
+  };
+  // StreamFirefly is often opened while a video is already playing; that video is the focus right away.
+  const focusPlayingVideo = () => {
+    const playing = [...document.querySelectorAll("video")].filter(focusable).sort((a, b) => visibleArea(b) - visibleArea(a))[0];
+    if (playing) reportFocus(playing);
+  };
+  document.addEventListener("playing", event => {
+    const video = event.target;
+    // An off-screen player starting must not cancel a visible one that is still settling.
+    if (!active || !focusable(video)) return;
+    clearTimeout(focusTimer);
+    focusTimer = setTimeout(() => { if (active && focusable(video)) reportFocus(video); }, 1500);
+  }, true);
   window.addEventListener("message", event => {
     if (event.source !== window || event.data?.source !== "streamfirefly") return;
     const message = event.data.type === "key" ? { type: "deep.key.add", payload: { hex: event.data.hex, source: event.data.foundBy, documentToken } } : event.data.type === "media" ? { type: "media.add", candidate: event.data.candidate } : null;
@@ -74,7 +115,7 @@
   api.runtime.onMessage?.addListener((message, _sender, respond) => {
     if (message?.type === "probe.identity") { respond({ documentToken }); return false; }
     if (message?.type === "media.sniffing.control") { void setActive(Boolean(message.active)); respond({ ok: true }); return false; }
-    if (message?.type === "media.rescan") { if (active) { seen.clear(); scan(); } return { ok: true }; }
+    if (message?.type === "media.rescan") { if (active) { seen.clear(); focusedUrl = ""; scan(); focusPlayingVideo(); } return { ok: true }; }
     if (window !== window.top) return false;
     if (message?.type === "workspace.unmount") {
       window.dispatchEvent(new CustomEvent("streamfirefly-workspace-unmount"));
@@ -94,8 +135,10 @@
     pending = [];
     for (const message of buffered) api.runtime.sendMessage(message).catch?.(() => {});
     seen.clear();
+    focusedUrl = "";
     observer.observe(document.documentElement, { childList: true, subtree: true });
     scan();
+    focusPlayingVideo();
     reportTimedResources();
   }
   async function setActive(next) {

@@ -18,6 +18,8 @@ export interface MediaCandidate {
   height?: number | null;
   duration?: number | null;
   poster?: string | null;
+  /** "preview" when the cover was captured from the preview player, "dom-fallback" when borrowed from the page's only video. */
+  posterSource?: string;
   live?: boolean | null;
   detectedAt?: number;
   source?: string;
@@ -52,6 +54,14 @@ export interface UiContext {
   sniffingActive: boolean;
   candidates: MediaCandidate[];
   resourceViewState: ResourceViewState;
+  /** The video the page is currently playing, used to pin it and its downloadable copies. */
+  focus?: PageFocus | null;
+}
+
+export interface PageFocus {
+  url: string;
+  poster?: string | null;
+  duration?: number | null;
 }
 
 export interface TaskOutput {

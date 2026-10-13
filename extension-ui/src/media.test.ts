@@ -1,4 +1,4 @@
-import { betterAlternative, chooseHlsContainer, defaultAudio, defaultVariant, deriveMediaPlaylist, filterCandidates, hlsEncryptionMethods, isBlobCandidate, parseHls, segmentRangeForTime, sortCandidates, validateHlsKeyOverride } from "./media";
+import { betterAlternative, chooseHlsContainer, defaultAudio, defaultVariant, deriveMediaPlaylist, filterCandidates, focusedCandidateIds, hlsEncryptionMethods, isBlobCandidate, parseHls, segmentRangeForTime, sortCandidates, validateHlsKeyOverride } from "./media";
 import type { MediaCandidate } from "./types";
 
 const masterText = `#EXTM3U
@@ -58,6 +58,49 @@ test("sorts resources without treating manifest bytes as media size", () => {
   expect(sortCandidates(items, "detected").map(item => item.id)).toEqual(["unknown", "image", "audio", "manifest", "video"]);
   expect(sortCandidates(items, "size").map(item => item.id)).toEqual(["image", "video", "audio", "unknown", "manifest"]);
   expect(sortCandidates(items, "duration")[0].id).toBe("video");
+});
+
+test("pins the page's current video and its downloadable copies only in the default order", () => {
+  const items: MediaCandidate[] = [
+    { id: "other", url: "https://example/other.mp4", type: "video", size: 900, duration: 40, poster: "https://example/other.jpg", detectedAt: 500 },
+    { id: "blob", url: "blob:https://example/current", type: "video", duration: 30, detectedAt: 100 },
+    { id: "hls", url: "https://example/current.m3u8", type: "hls", sizeKind: "manifest", duration: 30.2, detectedAt: 200 },
+    { id: "unrelated", url: "https://example/unrelated.m3u8", type: "hls", sizeKind: "manifest", duration: 90, detectedAt: 300 }
+  ];
+  const focused = focusedCandidateIds(items, { url: "blob:https://example/current", duration: 30 });
+  expect([...focused].sort()).toEqual(["blob", "hls"]);
+  expect(sortCandidates(items, "detected", focused).map(item => item.id)).toEqual(["hls", "blob", "other", "unrelated"]);
+  expect(sortCandidates(items, "size", focused)[0].id).toBe("other");
+  expect(sortCandidates(items, "duration", focused).map(item => item.id)).toEqual(["other", "unrelated", "hls", "blob"]);
+  expect(focusedCandidateIds(items, { url: "blob:https://example/gone" }).size).toBe(0);
+  expect(focusedCandidateIds(items, null).size).toBe(0);
+  const byPoster = focusedCandidateIds(items, { url: "blob:https://example/other-player", poster: "https://example/other.jpg" });
+  expect([...byPoster]).toEqual(["other"]);
+});
+
+test("a frame captured by the preview player does not count as a different cover", () => {
+  const low: MediaCandidate = { id: "low", url: "https://example/low.mp4", type: "video", width: 640, height: 360, duration: 30, poster: "data:image/jpeg;base64,AA==", posterSource: "preview", detectedAt: 1 };
+  const high: MediaCandidate = { id: "high", url: "https://example/high.m3u8", type: "hls", width: 1920, height: 1080, duration: 30, poster: "https://example/cover.jpg", detectedAt: 2 };
+  expect(betterAlternative(low, [low, high])).toEqual({ candidate: high, reason: "resolution" });
+  expect([...focusedCandidateIds([low, high], { url: "https://example/low.mp4" })].sort()).toEqual(["high", "low"]);
+});
+
+test("a different cover rules out a duration match", () => {
+  const items: MediaCandidate[] = [
+    { id: "blob", url: "blob:https://example/current", type: "video", poster: "https://example/current.jpg", duration: 30, detectedAt: 1 },
+    { id: "lookalike", url: "https://example/lookalike.m3u8", type: "hls", poster: "https://example/lookalike.jpg", duration: 30.1, detectedAt: 2 },
+    { id: "bare", url: "https://example/current.m3u8", type: "hls", duration: 30.2, detectedAt: 3 }
+  ];
+  expect([...focusedCandidateIds(items, { url: "blob:https://example/current" })].sort()).toEqual(["bare", "blob"]);
+});
+
+test("a cover captured from the preview player does not move the row", () => {
+  const items: MediaCandidate[] = [
+    { id: "previewed", url: "https://example/a.mp4", type: "video", poster: "data:image/jpeg;base64,AA==", posterSource: "preview", detectedAt: 300 },
+    { id: "page-cover", url: "https://example/b.mp4", type: "video", poster: "https://example/b.jpg", detectedAt: 100 },
+    { id: "bare", url: "https://example/c.mp4", type: "video", detectedAt: 200 }
+  ];
+  expect(sortCandidates(items, "detected").map(item => item.id)).toEqual(["page-cover", "previewed", "bare"]);
 });
 
 test.each(["detected", "size", "duration"])("prioritizes downloadable resources over Blob capture in %s mode", mode => {

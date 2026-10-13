@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { copyResources } from "../features/configuration/copy";
 import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
-import type { MediaCandidate, ResourceViewState } from "../types";
-import { betterAlternative, filterCandidates, isBlobCandidate, sortCandidates } from "../media";
+import type { MediaCandidate, PageFocus, ResourceViewState } from "../types";
+import { betterAlternative, filterCandidates, focusedCandidateIds, isBlobCandidate, sortCandidates } from "../media";
 import { formatBytes, formatDuration, sourceLabel, typeLabel } from "../format";
 import { sendMessage } from "../api";
 import SfIcon from "../ui/SfIcon.vue";
@@ -28,7 +28,7 @@ function loadHls(): Promise<HlsConstructor> {
   return hlsModulePromise;
 }
 
-const props = defineProps<{ candidates: MediaCandidate[]; loading: boolean; viewState: ResourceViewState; compact?: boolean; coverOnly?: boolean; suspended?: boolean; connected?: boolean; externalEnabled?: boolean }>();
+const props = defineProps<{ candidates: MediaCandidate[]; focus?: PageFocus | null; loading: boolean; viewState: ResourceViewState; compact?: boolean; coverOnly?: boolean; suspended?: boolean; connected?: boolean; externalEnabled?: boolean }>();
 const emit = defineEmits<{
   download: [candidate: MediaCandidate];
   externalDownload: [candidates: MediaCandidate[]];
@@ -61,7 +61,8 @@ let preparationTimer = 0;
 
 const resourceCandidates = computed(() => props.candidates.filter(item => item.type !== "segment"));
 const filtered = computed(() => filterCandidates(resourceCandidates.value, props.viewState.pattern, props.viewState.type, props.viewState.minMb, props.viewState.maxMb, props.viewState.minDuration, props.viewState.maxDuration));
-const visible = computed(() => sortCandidates(filtered.value.items, props.viewState.sortMode));
+const focused = computed(() => focusedCandidateIds(resourceCandidates.value, props.focus));
+const visible = computed(() => sortCandidates(filtered.value.items, props.viewState.sortMode, focused.value));
 const expanded = computed(() => visible.value.find(item => item.id === props.viewState.expandedId) || null);
 const captureExplanation = "缓存捕捉也能把视频保存到本地：有些网站不提供可直接下载的地址（显示为 Blob），流萤会在视频播放时录下加载的视频数据，播完自动保存成文件。";
 const captureCount = computed(() => visible.value.filter(isBlobCandidate).length);
@@ -394,7 +395,7 @@ onBeforeUnmount(() => { void disposePreview(); });
             <label class="row-check"><input type="checkbox" class="checkbox" :checked="selectedIds.has(item.id)" :aria-label="`选择${resourceName(item)}`" @change="toggleSelection(item.id)"></label>
             <span class="type-tile" :class="{ thumb: coverUrl(item) }" :data-type="item.type" :title="typeLabel(item.type)"><img v-if="coverUrl(item)" :src="coverUrl(item)" alt="" loading="lazy" decoding="async" @error="markImageFailed(coverUrl(item))"><SfIcon v-else :name="typeIcons[item.type] || 'file'" /></span>
             <button class="row-main" type="button" :aria-expanded="viewState.expandedId === item.id" :title="resourceName(item)" @click="toggleDetails(item)">
-              <span class="row-title"><strong>{{ resourceName(item) }}</strong><em v-if="isStream(item)" class="chip">{{ typeLabel(item.type) }}</em><em v-if="item.live" class="chip live">直播</em></span>
+              <span class="row-title"><strong>{{ resourceName(item) }}</strong><em v-if="isStream(item)" class="chip">{{ typeLabel(item.type) }}</em><em v-if="item.live" class="chip live">直播</em><em v-if="focused.has(item.id)" class="chip current">当前视频</em></span>
               <span class="row-meta">{{ resourceMeta(item) }}</span>
             </button>
             <span class="cell-resolution">{{ item.width && item.height ? `${item.width}×${item.height}` : '—' }}</span><span class="cell-duration">{{ item.duration ? formatDuration(item.duration) : '—' }}</span><span class="cell-size">{{ sizeText(item) }}</span>

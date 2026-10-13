@@ -1,4 +1,4 @@
-import type { MediaCandidate } from "./types";
+import type { MediaCandidate, PageFocus } from "./types";
 
 export interface HlsKey { method: string; uri: string | null; iv: string | null; keyFormat: string | null }
 export interface HlsMap { uri: string; byteRange: string | null }
@@ -205,11 +205,17 @@ export function deriveMediaPlaylist(manifest: HlsManifest, first: number, last: 
 
 export function isBlobCandidate(item: MediaCandidate): boolean { return item.url.startsWith("blob:"); }
 
-export function sortCandidates(items: MediaCandidate[], mode: string): MediaCandidate[] {
+/** A cover captured from the preview player is display-only; it must not move the row into the "has cover" tier. */
+function hasListedPoster(item: MediaCandidate): boolean { return Boolean(item.poster) && item.posterSource !== "preview"; }
+
+/** In the default order the page's current video and its copies come first; explicit size or duration sorting is left alone. */
+export function sortCandidates(items: MediaCandidate[], mode: string, focused: ReadonlySet<string> = new Set()): MediaCandidate[] {
   return [...items].sort((a, b) => {
+    const focusOrder = mode === "detected" ? Number(!focused.has(a.id)) - Number(!focused.has(b.id)) : 0;
+    if (focusOrder) return focusOrder;
     const captureOrder = Number(isBlobCandidate(a)) - Number(isBlobCandidate(b));
     if (captureOrder) return captureOrder;
-    const posterOrder = Number(!a.poster) - Number(!b.poster);
+    const posterOrder = Number(!hasListedPoster(a)) - Number(!hasListedPoster(b));
     if (posterOrder) return posterOrder;
     if (mode === "size") return candidateSize(b) - candidateSize(a) || (b.detectedAt || 0) - (a.detectedAt || 0);
     if (mode === "duration") return (b.duration || 0) - (a.duration || 0) || (b.detectedAt || 0) - (a.detectedAt || 0);
@@ -219,16 +225,38 @@ export function sortCandidates(items: MediaCandidate[], mode: string): MediaCand
 
 export interface MediaAlternative { candidate: MediaCandidate; reason: "resolution" | "downloadable" }
 
+const playable = (candidate: MediaCandidate) => ["video", "hls", "dash"].includes(candidate.type);
+// A frame captured by the preview player says nothing about which video it is, so it never counts as a cover here.
+const posterKey = (candidate: MediaCandidate) => { if (candidate.posterSource === "preview") return ""; try { const url = new URL(candidate.poster || ""); return url.origin + url.pathname; } catch { return ""; } };
+
+/** Downloadable copies that look like the same video: same cover image, or the same duration within 2% unless their covers differ. */
+function sameVideoCopies(item: MediaCandidate, candidates: MediaCandidate[]): MediaCandidate[] {
+  const ownPoster = posterKey(item);
+  return candidates.filter(other => {
+    if (other.id === item.id || !playable(other) || isBlobCandidate(other) || other.live) return false;
+    const otherPoster = posterKey(other);
+    if (ownPoster && otherPoster) return ownPoster === otherPoster;
+    return Boolean(item.duration) && Boolean(other.duration) && Math.abs(item.duration! - other.duration!) <= Math.max(1, item.duration! * 0.02);
+  });
+}
+
+/** The page's current video (matched by address) plus the copies that look like the same video. */
+export function focusedCandidateIds(candidates: MediaCandidate[], focus?: PageFocus | null): Set<string> {
+  const ids = new Set<string>();
+  if (!focus?.url) return ids;
+  const withoutHash = (url: string) => url.split("#", 1)[0];
+  const own = candidates.find(item => withoutHash(item.url) === withoutHash(focus.url));
+  if (own) ids.add(own.id);
+  const current: MediaCandidate = { ...own, id: own?.id || "page-focus", url: focus.url, type: own?.type || "video", poster: own?.poster || focus.poster || null, duration: own?.duration || focus.duration || null };
+  for (const copy of sameVideoCopies(current, candidates)) ids.add(copy.id);
+  return ids;
+}
+
 /** Finds a likely better copy of the same video: matching cover image or duration, then higher resolution or direct download. */
 export function betterAlternative(item: MediaCandidate, candidates: MediaCandidate[]): MediaAlternative | null {
-  const playable = (candidate: MediaCandidate) => ["video", "hls", "dash"].includes(candidate.type);
   if (!playable(item)) return null;
-  const posterKey = (candidate: MediaCandidate) => { try { const url = new URL(candidate.poster || ""); return url.origin + url.pathname; } catch { return ""; } };
   const pixels = (candidate: MediaCandidate) => (candidate.width || 0) * (candidate.height || 0);
-  const ownPoster = posterKey(item);
-  const matches = candidates.filter(other => other.id !== item.id && playable(other) && !isBlobCandidate(other) && !other.live && (
-    (ownPoster && posterKey(other) === ownPoster)
-    || (Boolean(item.duration) && Boolean(other.duration) && Math.abs(item.duration! - other.duration!) <= Math.max(1, item.duration! * 0.02))));
+  const matches = sameVideoCopies(item, candidates);
   const higher = pixels(item) ? matches.filter(other => pixels(other) > pixels(item)).sort((a, b) => pixels(b) - pixels(a))[0] : undefined;
   if (higher) return { candidate: higher, reason: "resolution" };
   if (!isBlobCandidate(item)) return null;

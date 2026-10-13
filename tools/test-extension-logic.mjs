@@ -294,6 +294,17 @@ const knownSize = await send({ type: 'media.size.probe', tabId: 7, sourceContext
 if (!knownSize.ok || knownSize.candidate.size !== 8192 || knownSize.candidate.sizeSource !== 'content-range' || fetchCalls.length !== fetchesBeforeKnown) throw new Error(`Size probe replaced a network size: ${JSON.stringify(knownSize)}`);
 await send({ type: 'media.add', candidate: { url: 'https://media.example/watch/clip.ogv', mime: 'video/ogg', size: 4096, sizeSource: 'content-length', source: 'network' } }, { tab: { id: 7 } });
 if ((await send({ type: 'media.candidates', tabId: 7 })).find(item => item.url.endsWith('/clip.ogv')).size !== 4096) throw new Error('A network size did not replace a probed size');
+const previewPoster = await send({ type: 'media.metadata.update', tabId: 7, sourceContextId: probeContextId, payload: { id: video.id, url: video.url, poster: 'data:image/jpeg;base64,AA==' } });
+if (!previewPoster.ok || previewPoster.candidate.posterSource !== 'preview') throw new Error(`Preview cover was not marked: ${JSON.stringify(previewPoster.candidate)}`);
+await send({ type: 'media.add', candidate: { url: video.url, mime: 'video/mp4', poster: 'https://media.example/real-cover.jpg', source: 'dom' } }, { tab: { id: 7 } });
+const recovered = (await send({ type: 'media.candidates', tabId: 7 })).find(item => item.id === video.id);
+if (recovered.poster !== 'https://media.example/real-cover.jpg' || recovered.posterSource) throw new Error(`A page cover kept the preview mark: ${JSON.stringify(recovered)}`);
+const sameCover = await send({ type: 'media.metadata.update', tabId: 7, sourceContextId: probeContextId, payload: { id: video.id, url: video.url, poster: 'https://media.example/real-cover.jpg', duration: 12 } });
+if (!sameCover.ok || sameCover.candidate.posterSource) throw new Error(`Reporting the existing page cover marked it as a preview frame: ${JSON.stringify(sameCover.candidate)}`);
+const focusSet = await send({ type: 'media.focus', focus: { url: 'blob:https://media.example/generated', poster: 'javascript:alert(1)', duration: 18.5 } }, { tab: { id: 7 } });
+const pageFocus = (await send({ type: 'ui.context.get', scope: 'active' })).context.focus;
+if (!focusSet.ok || pageFocus?.url !== 'blob:https://media.example/generated' || pageFocus.poster !== null || pageFocus.duration !== 18.5) throw new Error(`Page focus was not exposed safely: ${JSON.stringify(pageFocus)}`);
+if ((await send({ type: 'media.focus', focus: { url: 'javascript:alert(1)' } }, { tab: { id: 7 } })).ok) throw new Error('Page focus accepted a script address');
 
 await send({ type: 'preview.headers.apply', payload: { previewSessionId: 'preview-a', candidateId: video.id, url: video.url, headers: video.requestHeaders } }, { tab: { id: 7 } });
 if (listeners.previewRules?.addRules?.[0]?.condition?.tabIds?.[0] !== 7) throw new Error(`Preview rule was not scoped to the source tab: ${JSON.stringify(listeners.previewRules)}`);
@@ -314,6 +325,7 @@ listeners.history({ tabId: 7, frameId: 0, url: tabsById.get(7).url });
 await settle();
 candidates = await send({ type: 'media.candidates', tabId: 7 });
 if (candidates.length) throw new Error('SPA navigation did not clear candidates');
+if ((await send({ type: 'ui.context.get', scope: 'active' })).context.focus) throw new Error('SPA navigation kept the previous page focus');
 
 listeners.storageChanged({ detectImages: { newValue: true } }, 'local');
 await send({ type: 'media.add', candidate: { url: 'https://media.example/enabled.jpg', mime: 'image/jpeg' } }, { tab: { id: 7 } });

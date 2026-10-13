@@ -73,7 +73,7 @@ async function uiContextForTab(tab) {
     await clearTab(sourceTabId, pageUrl);
     state = await loadTabState(sourceTabId);
   }
-  return { sourceTabId, sourceContextId: state.sourceContextId, pageUrl, pageTitle: pageTitleFor(tab), favIconUrl: tab?.favIconUrl || "", supported: true, paused: Boolean(state.paused), sniffingActive: !state.paused && sniffing.allowed(sourceTabId), resourceViewState: normalizeResourceViewState(state.resourceViewState), candidates: candidatesForUi(state) };
+  return { sourceTabId, sourceContextId: state.sourceContextId, pageUrl, pageTitle: pageTitleFor(tab), favIconUrl: tab?.favIconUrl || "", supported: true, paused: Boolean(state.paused), sniffingActive: !state.paused && sniffing.allowed(sourceTabId), resourceViewState: normalizeResourceViewState(state.resourceViewState), candidates: candidatesForUi(state), focus: state.focus || null };
 }
 
 function candidatesForUi(state) {
@@ -205,6 +205,7 @@ function mergeCandidate(existing, item) {
   if (existing?.contentDisposition && !item?.contentDisposition) merged.contentDisposition = existing.contentDisposition;
   if (existing?.requestHeaders && (!item?.requestHeaders || !Object.keys(item.requestHeaders).length)) merged.requestHeaders = existing.requestHeaders;
   if (existing?.inlineManifest && !item?.inlineManifest) merged.inlineManifest = existing.inlineManifest;
+  if (item?.poster && item.poster !== existing?.poster && !item.posterSource) delete merged.posterSource;
   return merged;
 }
 
@@ -350,7 +351,11 @@ async function updateCandidateMetadata(tabId, sourceContextId, payload = {}) {
       if (Number.isFinite(value) && value > 0) metadata[key] = value;
     }
     if (typeof payload.live === "boolean") metadata.live = payload.live;
-    if (typeof payload.poster === "string" && payload.poster.length <= 2 * 1024 * 1024 && /^(?:https?:|data:image\/|blob:)/i.test(payload.poster)) metadata.poster = payload.poster;
+    if (typeof payload.poster === "string" && payload.poster !== existing.poster && payload.poster.length <= 2 * 1024 * 1024 && /^(?:https?:|data:image\/|blob:)/i.test(payload.poster)) {
+      metadata.poster = payload.poster;
+      // A frame captured from the preview player is shown as the cover, but it must not reorder the list.
+      if (payload.poster.startsWith("data:")) metadata.posterSource = "preview";
+    }
     if (!Object.keys(metadata).length) return { ok: true, candidate: existing };
     const candidate = { ...existing, ...metadata, metadataSource: "preview", lastSeenAt: Date.now() };
     state.candidates.set(id, candidate);
@@ -358,6 +363,25 @@ async function updateCandidateMetadata(tabId, sourceContextId, payload = {}) {
     schedulePersist(state);
     notifyUiContext(tabId);
     return { ok: true, candidate };
+  });
+}
+
+/**
+ * Remembers the video the page is currently playing so the UI can pin it and its
+ * downloadable copy. Kept in memory only; a reload or navigation starts without it.
+ */
+async function setPageFocus(tabId, payload = {}) {
+  if (!Number.isInteger(tabId) || tabId < 0) return { ok: false, error: "source_tab_unavailable" };
+  const url = typeof payload.url === "string" && payload.url.length <= 4096 ? payload.url : "";
+  if (!/^(?:https?:|blob:)/i.test(url)) return { ok: false, error: "media_url_unsupported" };
+  return queueTab(tabId, async () => {
+    const state = await loadTabState(tabId);
+    if (state.paused || !sniffing.allowed(tabId)) return { ok: false, error: "sniffing_inactive" };
+    const poster = typeof payload.poster === "string" && payload.poster.length <= 4096 && /^https?:/i.test(payload.poster) ? payload.poster : null;
+    const duration = Number(payload.duration);
+    state.focus = { url, poster, duration: Number.isFinite(duration) && duration > 0 ? duration : null };
+    notifyUiContext(tabId);
+    return { ok: true };
   });
 }
 
@@ -526,5 +550,5 @@ async function clearExtracted() {
     updateBadge(state); notifyUiContext(tabId);
   });
 }
-return { refreshBadgeForContext, subscribeCandidates(listener) { candidateListeners.add(listener); return () => candidateListeners.delete(listener); }, clearExtracted, reevaluate, loadTabState, uiContextForTab, resolveUiTab, notifyUiContext, queueTab, rememberRequestContext, parseContentRange, addCandidate, clearTab, resolveRequestTabId, setSniffingPaused, patchResourceViewState, updateCandidateMetadata, removeCandidates, candidateFor, fetchMediaText, probeMediaSize };
+return { refreshBadgeForContext, subscribeCandidates(listener) { candidateListeners.add(listener); return () => candidateListeners.delete(listener); }, clearExtracted, reevaluate, loadTabState, uiContextForTab, resolveUiTab, notifyUiContext, queueTab, rememberRequestContext, parseContentRange, addCandidate, clearTab, resolveRequestTabId, setSniffingPaused, patchResourceViewState, updateCandidateMetadata, removeCandidates, candidateFor, fetchMediaText, probeMediaSize, setPageFocus };
 }
