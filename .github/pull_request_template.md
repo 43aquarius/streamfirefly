@@ -1,4 +1,5 @@
 <!-- 请按下面各节填写，贡献规则见 CONTRIBUTING.md。English is welcome. -->
+<!-- 一个 PR 只解决一个问题或一个功能；多个不相关的修复请拆成多个 PR。 -->
 
 ## 改了什么 / What changed
 
@@ -11,6 +12,10 @@
 ## 关联 issue / Linked issue
 
 <!-- 例如 Fixes #12。大的改动请先开 issue 讨论。 -->
+
+## 截图（界面改动时）/ Screenshots
+
+<!-- 改了界面的话，建议附上改动前后的截图；没有界面变化可以不填或删掉这一节。 -->
 
 ## 验证 / Testing
 

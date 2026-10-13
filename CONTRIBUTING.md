@@ -13,6 +13,7 @@ English contributions are welcome. Please follow the same rules below.
 ## 提 PR
 
 - 大的改动请先开 issue 讨论，避免做了之后方向不合适。
+- 一个 PR 只做一件事。几件不相关的事混在一起的 PR，会请你拆开再提交。
 - 构建和测试方法见 README 的[从源码构建](README.md#从源码构建)和[开发](README.md#开发)。
 - 提交前至少运行：
 
