@@ -169,27 +169,24 @@ pub(crate) fn run() -> io::Result<()> {
     shutdown_host(&store, &captures)
 }
 
-/// Reaps children, then lets existing publishers finish durable output ownership.
+/// Ends every download child so no orphaned writer outlives the host.
 pub(crate) fn shutdown_downloads(store: &TaskRuntime) -> Result<(), String> {
-    let children = crate::processes::shutdown_processes(store);
-    let publication = wait_for_publications(store);
-    children.and(publication)
-}
-
-fn wait_for_publications(store: &TaskRuntime) -> Result<(), String> {
-    let _publishers = store.publications.write().map_err(|_| "publication_unavailable")?;
-    if store.publication_failed.load(std::sync::atomic::Ordering::Relaxed) {
-        Err("publication_cleanup_failed".into())
-    } else { Ok(()) }
+    crate::processes::shutdown_processes(store)
 }
 
 /// Normal EOF shutdown: freeze task scheduling and retries first, end the download
-/// children, then stop capture sessions and wait for their workers. Any cleanup failure
-/// exits non-zero instead of pretending success.
+/// children, then stop capture sessions and wait for their workers. The task map stays
+/// locked until exit so an output move and its saved state land together or not at all.
+/// Any cleanup failure exits non-zero instead of pretending success.
 fn shutdown_host(store: &TaskRuntime, captures: &crate::capture::CaptureManager) -> ! {
     store.exiting.store(true, std::sync::atomic::Ordering::SeqCst);
     let download_result = shutdown_downloads(store);
     let capture_result = captures.shutdown();
+    let _tasks = store
+        .repository
+        .tasks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match (download_result, capture_result) {
         (Ok(()), Ok(())) => std::process::exit(0),
         (download, capture) => {

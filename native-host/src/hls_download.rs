@@ -34,7 +34,7 @@ use crate::segment_transfer::{
     authorization_error, curl_once, retry_after_seconds, retryable_error, wait_retry,
 };
 use crate::task_state::update;
-use crate::hls_publication::HlsPublication;
+use crate::hls_publication::{publish_work_path, HlsPublication};
 use crate::wire::Writer;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -389,13 +389,10 @@ pub(crate) fn merge_hls_checkpoint(
     });
     if !media_already_done {
         let output_path = Path::new(output);
-        let temporary = work_dir.join(format!(
-            "media-publish.{}",
-            output_path
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("mp4")
-        ));
+        let temporary = publish_work_path(output_path, &task.id);
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).map_err(|_| "path_not_writable".to_string())?;
+        }
         let mut args = vec![
             "-nostdin".into(),
             "-y".into(),
@@ -450,6 +447,7 @@ pub(crate) fn merge_hls_checkpoint(
                 }
             }
             Err(error) => {
+                let _ = fs::remove_file(&temporary);
                 if error != "cancelled" {
                     update(store, writer, &task.id, |current| {
                         set_output_state(current, "media", 0, "failed", Some(error.clone()))
@@ -500,7 +498,7 @@ pub(crate) fn merge_hls_checkpoint(
             set_output_state(current, "subtitle", subtitle_index, "running", None)
         });
         let playlist = local_playlist(subtitle, &work_dir.join(&subtitle.id))?;
-        let temporary = work_dir.join(format!("subtitle-publish-{subtitle_index}.vtt"));
+        let temporary = publish_work_path(Path::new(&path), &task.id);
         let args = vec![
             "-nostdin".into(),
             "-y".into(),
@@ -547,8 +545,12 @@ pub(crate) fn merge_hls_checkpoint(
                     }
                 }
             }
-            Err(error) if error == "cancelled" => return Err(error),
+            Err(error) if error == "cancelled" => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
             Err(error) => {
+                let _ = fs::remove_file(&temporary);
                 subtitle_failures += 1;
                 update(store, writer, &task.id, |current| {
                     set_output_state(current, "subtitle", subtitle_index, "failed", Some(error))

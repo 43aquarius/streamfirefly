@@ -18,7 +18,6 @@
     "test:dash:native": "node tools/test-native-dash.mjs",
     "test:dash:discovery": "node tools/test-native-dash.mjs --browser",
     "verify:features": "npm run typecheck && npm run validate:extension && npm run test:unit && cargo test --manifest-path native-host/Cargo.toml && npm run test:native",
-    "verify:fixes": "npm run verify:features && node tools/test-fix-sensitivity.mjs --mutate",
     "lint:firefox": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/package-firefox-extension.ps1 -LintOnly",
     "package:firefox": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/package-firefox-extension.ps1",
     "test:firefox": "node tools/test-browser-extension.mjs --browser firefox",

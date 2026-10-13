@@ -59,7 +59,7 @@ try {
                 $suspended = $true
                 $null = $seen.Add($candidateId)
                 $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$candidateId" -OperationTimeoutSec 5
-                if ($processInfo.CommandLine -notmatch 'subtitle-publish-\d+\.vtt') { continue }
+                if ($processInfo.CommandLine -notmatch '\.streamfirefly-part-[^\\/"]+\.vtt') { continue }
                 $marker = @{ pid = $candidateId; parent = $NativePid; commandLine = $processInfo.CommandLine } | ConvertTo-Json -Compress
                 [IO.File]::WriteAllText((Join-Path $ControlDirectory 'held.json'), $marker)
                 while ([DateTime]::UtcNow -lt $deadline -and -not (Test-Path -LiteralPath $stopFile) -and

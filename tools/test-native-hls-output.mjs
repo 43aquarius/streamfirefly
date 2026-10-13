@@ -100,6 +100,7 @@ function payload(name, { subtitles = true, fileName = name } = {}) {
       subtitles: subtitles ? [{ language: 'en', label: 'English', extension: 'vtt', manifest: { format: 'hls', baseUrl: `${origin}/${name}/sub.m3u8`, text: `#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:1,\n${origin}/${name}/sub.vtt\n#EXT-X-ENDLIST\n` } }] : [] } };
 }
 const digest = file => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const workFiles = () => fs.readdirSync(downloads).filter(name => name.includes('.streamfirefly-part-'));
 const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
 async function subtitleEofRecovery(host) {
   assert.equal(process.platform, 'win32', 'subtitle EOF barrier requires Windows');
@@ -126,7 +127,7 @@ async function subtitleEofRecovery(host) {
   }, 'live subtitle FFmpeg');
   barrier.marker = marker;
   assert.equal(marker.parent, host.child.pid);
-  assert.match(marker.commandLine, /subtitle-publish-\d+\.vtt/);
+  assert.match(marker.commandLine, /\.streamfirefly-part-[^\\/"]+\.vtt/);
   assert.ok(alive(marker.pid), 'subtitle FFmpeg was not alive before EOF');
   const mediaHash = digest(created.task.output);
   await closeHost(host);
@@ -165,6 +166,7 @@ try {
   assert.match(fs.readFileSync(subtitleOutput.path, 'utf8'), /WEBVTT[\s\S]*subtitle sentinel/);
   const decoded = spawnSync(fixtureFfmpeg, ['-nostdin', '-v', 'error', '-i', completed.output, '-f', 'null', 'NUL'], { windowsHide: true });
   assert.equal(decoded.status, 0, decoded.stderr?.toString());
+  assert.deepEqual(workFiles(), [], 'published work files were left in the save folder');
 
   for (const kind of ['media', 'subtitle', 'directory']) {
     const name = `late-${kind}`; blocked.add(name);
@@ -179,6 +181,9 @@ try {
     assert.equal(failed.state, kind === 'subtitle' ? 'partial' : 'failed', JSON.stringify(failed));
     assert.equal(failed.message, '输出文件已存在或被其他任务占用，请保留原文件并新建任务。');
     if (kind !== 'directory') assert.equal(fs.readFileSync(target, 'utf8'), `sentinel-${kind}`);
+    assert.deepEqual(workFiles(), [], `conflicting ${kind} left its work file in the save folder`);
+    const taskWork = path.join(temporary, 'StreamFireFly/tasks', failed.id);
+    if (fs.existsSync(taskWork)) assert.deepEqual(fs.readdirSync(taskWork, { recursive: true }).filter(name => name.endsWith('.mkv')), [], 'task work folder kept a full media copy');
     const mediaHash = kind === 'subtitle' ? digest(failed.output) : null;
     assert.equal((await host.send('task.control', { id: failed.id, action: 'retry' })).ok, true);
     const retried = await settled(host, failed.id);

@@ -878,7 +878,7 @@ fn publish_refuses_paths_reserved_by_another_task() {
 }
 
 #[test]
-fn publish_copies_content_and_reports_success() {
+fn publish_moves_content_and_reports_success() {
     let dir = std::env::temp_dir().join(format!("streamfirefly-publish-ok-{}", Uuid::new_v4()));
     fs::create_dir_all(&dir).unwrap();
     let destination = dir.join("movie.mkv");
@@ -889,6 +889,7 @@ fn publish_copies_content_and_reports_success() {
         Ok(())
     );
     assert_eq!(fs::read(&destination).unwrap(), b"new-media-bytes");
+    assert!(!temporary.exists(), "publishing left the work file behind");
     fs::remove_dir_all(dir).unwrap();
 }
 

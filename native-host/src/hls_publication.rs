@@ -2,73 +2,86 @@ use crate::media_process::set_output_state;
 use crate::model::Task;
 use crate::repository::{persist_tasks, sanitized_task};
 use crate::runtime::{host_exiting, TaskRuntime};
-use crate::task_input::reserve_task_output;
+use crate::task_input::publish_task_output;
 use crate::wire::{emit, Writer};
 use serde_json::json;
-use std::{fs, path::Path, sync::{RwLockReadGuard, atomic::Ordering}};
+use std::{fs, path::{Path, PathBuf}};
+
+/// Work file for one output, kept beside the final path so publishing is a same-volume
+/// rename. The extension stays last so FFmpeg still picks the matching muxer.
+pub(crate) fn publish_work_path(destination: &Path, task_id: &str) -> PathBuf {
+    let stem = destination.file_stem().unwrap_or_default().to_string_lossy();
+    let name = match destination.extension() {
+        Some(extension) => format!("{stem}.streamfirefly-part-{task_id}.{}", extension.to_string_lossy()),
+        None => format!("{stem}.streamfirefly-part-{task_id}"),
+    };
+    destination.with_file_name(name)
+}
 
 pub(crate) struct HlsPublication<'a> {
     store: &'a TaskRuntime,
     writer: Option<&'a Writer>,
     id: &'a str,
-    _permit: RwLockReadGuard<'a, ()>,
 }
 
 impl<'a> HlsPublication<'a> {
     pub(crate) fn begin(store: &'a TaskRuntime, writer: Option<&'a Writer>, id: &'a str) -> Result<Self, &'static str> {
-        let permit = store.publications.read().map_err(|_| "publication_unavailable")?;
         if host_exiting(store) { return Err("host_stopping"); }
-        Ok(Self { store, writer, id, _permit: permit })
+        Ok(Self { store, writer, id })
     }
 
+    /// Moves the finished work file into place and saves the output state while holding
+    /// the task map. Host shutdown takes the same lock before exiting, so a moved file
+    /// never outlives the host without its persisted state.
     pub(crate) fn publish(&self, kind: &str, index: usize, source: &Path, destination: &Path) -> Result<(), &'static str> {
-        self.publish_with(kind, index, source, destination, |source, destination| {
-            std::io::copy(source, destination)?;
-            destination.sync_all()
-        })
-    }
-
-    fn publish_with(&self, kind: &str, index: usize, source: &Path, destination: &Path,
-        write: impl FnOnce(&mut fs::File, &mut fs::File) -> std::io::Result<()>) -> Result<(), &'static str> {
-        let mut pending = {
-            let tasks = self.store.repository.tasks.lock().unwrap();
-            reserve_task_output(source, destination, &tasks, self.id)?
-        };
-        let copy_result = pending.write_with(write);
-        if copy_result.is_err() {
-            if pending.discard().is_err() { self.store.publication_failed.store(true, Ordering::Relaxed); }
-            return Err("output_write_failed");
-        }
-        self.update(|task| {
-            set_output_state(task, kind, index, "succeeded", None);
-            if task.outputs.iter().all(|output| output.state == "succeeded") {
-                complete(task);
-                task.checkpoint_state = Some("recoverable".into());
+        let saved = {
+            let mut tasks = self.store.repository.tasks.lock().unwrap();
+            if let Err(error) = publish_task_output(source, destination, &tasks, self.id) {
+                let _ = fs::remove_file(source);
+                return Err(error);
             }
-        })?;
-        pending.commit();
-        Ok(())
+            let saved = self.save(&mut tasks, |task| {
+                set_output_state(task, kind, index, "succeeded", None);
+                if task.outputs.iter().all(|output| output.state == "succeeded") {
+                    complete(task);
+                    task.checkpoint_state = Some("recoverable".into());
+                }
+            });
+            if saved.is_err() {
+                // The output stays unpublished: hand the file back to its work path.
+                let _ = crate::persistence::move_new_file(destination, source);
+            }
+            saved
+        };
+        self.notify(saved)
     }
 
     fn update(&self, change: impl FnOnce(&mut Task)) -> Result<(), &'static str> {
-        let mut tasks = self.store.repository.tasks.lock().unwrap();
-        let task = tasks.iter_mut().find(|task| task.id == self.id).ok_or("task_not_found")?;
-        let previous = task.clone();
-        change(task);
-        task.revision = task.revision.saturating_add(1);
-        let public = sanitized_task(task);
-        if persist_tasks(&self.store.repository, &tasks).is_err() {
-            *tasks.iter_mut().find(|task| task.id == self.id).unwrap() = previous;
-            self.store.publication_failed.store(true, Ordering::Relaxed);
-            drop(tasks);
-            if let Some(writer) = self.writer {
-                emit(writer, json!({"version":1,"type":"task.persistence-error","id":self.id,"error":"task_store_write_failed"}));
-            }
+        let saved = self.save(&mut self.store.repository.tasks.lock().unwrap(), change);
+        self.notify(saved)
+    }
+
+    fn save(&self, tasks: &mut [Task], change: impl FnOnce(&mut Task)) -> Result<Task, &'static str> {
+        let index = tasks.iter().position(|task| task.id == self.id).ok_or("task_not_found")?;
+        let previous = tasks[index].clone();
+        change(&mut tasks[index]);
+        tasks[index].revision = tasks[index].revision.saturating_add(1);
+        if persist_tasks(&self.store.repository, tasks).is_err() {
+            tasks[index] = previous;
             return Err("task_store_write_failed");
         }
-        drop(tasks);
-        if let Some(writer) = self.writer { emit(writer, json!({"version":1,"type":"task.progress","task":public})); }
-        Ok(())
+        Ok(sanitized_task(&tasks[index]))
+    }
+
+    fn notify(&self, saved: Result<Task, &'static str>) -> Result<(), &'static str> {
+        if let Some(writer) = self.writer {
+            match &saved {
+                Ok(public) => emit(writer, json!({"version":1,"type":"task.progress","task":public})),
+                Err("task_store_write_failed") => emit(writer, json!({"version":1,"type":"task.persistence-error","id":self.id,"error":"task_store_write_failed"})),
+                Err(_) => {}
+            }
+        }
+        saved.map(|_| ())
     }
 
     pub(crate) fn finish(&self, work: &Path) -> Result<(), &'static str> {
@@ -97,86 +110,87 @@ fn complete(task: &mut Task) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{runtime::load_store, task_creation::create_task};
+    use crate::runtime::load_store;
     use std::{sync::{mpsc, atomic::Ordering}, thread, time::Duration};
     use uuid::Uuid;
 
-    fn fixture() -> (std::path::PathBuf, TaskRuntime, Task) {
+    fn fixture() -> (PathBuf, TaskRuntime, Task, PathBuf) {
         let root = std::env::temp_dir().join(format!("streamfirefly-publication-{}", Uuid::new_v4()));
         fs::create_dir_all(root.join("work")).unwrap();
-        fs::write(root.join("work/media.tmp"), b"complete-media").unwrap();
+        let part = publish_work_path(&root.join("movie.mkv"), "publishing");
+        fs::write(&part, b"complete-media").unwrap();
         fs::write(root.join("work/checkpoint.json"), b"checkpoint").unwrap();
         let store = load_store(&root.join("tasks.json"));
         let task: Task = serde_json::from_value(json!({"id":"publishing","url":"https://example.test/video.m3u8","title":"movie","mime":"application/vnd.apple.mpegurl","state":"running","progress":90,"output":root.join("movie.mkv"),"error":null,"hls_selection":true,"hls_plan_version":2,"outputs":[{"kind":"media","path":root.join("movie.mkv"),"state":"running","error":null}]})).unwrap();
         store.repository.tasks.lock().unwrap().push(task.clone());
         crate::repository::save_store(&store.repository).unwrap();
-        (root, store, task)
+        (root, store, task, part)
+    }
+
+    fn persisted(root: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(root.join("tasks.json")).unwrap()).unwrap()
     }
 
     #[test]
-    fn publication_does_not_hold_the_task_map_during_copy() {
-        let (root, store, task) = fixture();
-        let worker_store = store.clone();
-        let worker_root = root.clone();
-        let (started, ready) = mpsc::channel();
-        let (release, resume) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let owner = HlsPublication::begin(&worker_store, None, &task.id).unwrap();
-            owner.publish_with("media", 0, &worker_root.join("work/media.tmp"), Path::new(task.output.as_ref().unwrap()), |source, output| {
-                started.send(()).unwrap(); resume.recv_timeout(Duration::from_secs(5)).unwrap();
-                std::io::copy(source, output)?; output.sync_all()
-            })
-        });
-        ready.recv_timeout(Duration::from_secs(5)).unwrap();
-        let query_available = store.repository.tasks.try_lock().is_ok();
-        let created = if query_available {
-            Some(create_task(&store, &json!({"url":"https://example.test/other.mkv","fileName":"movie","saveDir":root,"mime":"video/x-matroska"})).unwrap())
-        } else { None };
-        release.send(()).unwrap();
-        worker.join().unwrap().unwrap();
-        fs::remove_dir_all(&root).unwrap();
-        assert!(query_available, "bulk copy held the global task map");
-        assert_eq!(created.unwrap().output, Some(root.join("movie (1).mkv").to_string_lossy().into_owned()));
+    fn work_file_sits_beside_the_output_and_keeps_its_extension() {
+        let dir = Path::new("downloads");
+        assert_eq!(publish_work_path(&dir.join("movie.en.vtt"), "abc"), dir.join("movie.en.streamfirefly-part-abc.vtt"));
+        assert_eq!(publish_work_path(&dir.join("movie"), "abc"), dir.join("movie.streamfirefly-part-abc"));
     }
 
     #[test]
-    fn eof_waits_for_copy_and_persists_completion_before_checkpoint_cleanup() {
-        let (root, store, task) = fixture();
-        let worker_store = store.clone();
-        let worker_root = root.clone();
-        let (started, ready) = mpsc::channel();
-        let (release, resume) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let owner = HlsPublication::begin(&worker_store, None, &task.id).unwrap();
-            owner.publish_with("media", 0, &worker_root.join("work/media.tmp"), Path::new(task.output.as_ref().unwrap()), |source, output| {
-                started.send(()).unwrap(); resume.recv_timeout(Duration::from_secs(5)).unwrap();
-                std::io::copy(source, output)?; output.sync_all()
-            }).unwrap();
-            owner.finish(&worker_root.join("work")).unwrap();
-        });
-        ready.recv_timeout(Duration::from_secs(5)).unwrap();
-        let stopping_store = store.clone();
-        let (stopped, finished) = mpsc::channel();
-        let stopper = thread::spawn(move || {
-            stopping_store.exiting.store(true, Ordering::SeqCst);
-            stopped.send(crate::protocol::shutdown_downloads(&stopping_store)).unwrap();
-        });
-        let waited = finished.recv_timeout(Duration::from_millis(100)).is_err();
-        release.send(()).unwrap(); worker.join().unwrap(); stopper.join().unwrap();
-        if waited { finished.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(); }
-        let persisted: serde_json::Value = serde_json::from_slice(&fs::read(root.join("tasks.json")).unwrap()).unwrap();
-        let state = persisted["tasks"][0]["state"].as_str().unwrap().to_owned();
-        let checkpoint_exists = root.join("work/checkpoint.json").exists();
+    fn publish_moves_work_file_and_saves_success() {
+        let (root, store, task, part) = fixture();
+        let owner = HlsPublication::begin(&store, None, &task.id).unwrap();
+        owner.publish("media", 0, &part, &root.join("movie.mkv")).unwrap();
         assert_eq!(fs::read(root.join("movie.mkv")).unwrap(), b"complete-media");
+        assert!(!part.exists(), "published work file was left beside the output");
+        let saved = persisted(&root);
+        assert_eq!(saved["tasks"][0]["state"], "succeeded");
+        assert_eq!(saved["tasks"][0]["checkpoint_state"], "recoverable");
+        owner.finish(&root.join("work")).unwrap();
+        assert!(!root.join("work").exists());
+        assert_eq!(persisted(&root)["tasks"][0]["checkpoint_state"], "cleaned");
         fs::remove_dir_all(root).unwrap();
-        assert!(waited, "EOF returned before the active publication settled");
-        assert_eq!(state, "succeeded", "EOF lost the published output's durable completion");
-        assert!(!checkpoint_exists);
+    }
+
+    #[test]
+    fn late_conflict_keeps_existing_file_and_drops_work_file() {
+        let (root, store, task, part) = fixture();
+        fs::write(root.join("movie.mkv"), b"original").unwrap();
+        let owner = HlsPublication::begin(&store, None, &task.id).unwrap();
+        assert_eq!(owner.publish("media", 0, &part, &root.join("movie.mkv")), Err("output_path_conflict"));
+        assert_eq!(fs::read(root.join("movie.mkv")).unwrap(), b"original");
+        assert!(!part.exists());
+        assert_eq!(persisted(&root)["tasks"][0]["state"], "running");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_and_save_wait_for_the_task_map() {
+        let (root, store, task, part) = fixture();
+        let destination = root.join("movie.mkv");
+        let held = store.repository.tasks.lock().unwrap();
+        let (worker_store, worker_part, worker_destination) = (store.clone(), part.clone(), destination.clone());
+        let (started, ready) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            HlsPublication::begin(&worker_store, None, &task.id).unwrap().publish("media", 0, &worker_part, &worker_destination)
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let moved_early = destination.exists();
+        drop(held);
+        worker.join().unwrap().unwrap();
+        let published = fs::read(&destination).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert!(!moved_early, "output moved while shutdown held the task map");
+        assert_eq!(published, b"complete-media");
     }
 
     #[test]
     fn completion_save_failure_retains_checkpoint() {
-        let (root, store, task) = fixture();
+        let (root, store, task, _) = fixture();
         fs::create_dir(store.repository.path.with_extension("tmp")).unwrap();
         let result = {
             let owner = HlsPublication::begin(&store, None, &task.id).unwrap();
@@ -189,27 +203,26 @@ mod tests {
     }
 
     #[test]
-    fn publication_save_failure_discards_only_its_output_and_reports_shutdown_failure() {
-        let (root, store, task) = fixture();
+    fn publication_save_failure_hands_the_file_back_to_its_work_path() {
+        let (root, store, task, part) = fixture();
         fs::write(root.join("unrelated.mkv"), b"original").unwrap();
         fs::create_dir(store.repository.path.with_extension("tmp")).unwrap();
         let result = {
             let owner = HlsPublication::begin(&store, None, &task.id).unwrap();
-            owner.publish("media", 0, &root.join("work/media.tmp"), &root.join("movie.mkv"))
+            owner.publish("media", 0, &part, &root.join("movie.mkv"))
         };
         assert_eq!(result, Err("task_store_write_failed"));
         assert!(!root.join("movie.mkv").exists());
+        assert_eq!(fs::read(&part).unwrap(), b"complete-media");
         assert_eq!(fs::read(root.join("unrelated.mkv")).unwrap(), b"original");
-        assert!(root.join("work/media.tmp").exists());
         assert!(root.join("work/checkpoint.json").exists());
         assert_eq!(store.repository.tasks.lock().unwrap()[0].state, "running");
-        assert_eq!(crate::protocol::shutdown_downloads(&store), Err("publication_cleanup_failed".into()));
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn eof_preserves_published_media_and_pending_subtitle_recovery() {
-        let (root, store, task) = fixture();
+        let (root, store, task, part) = fixture();
         {
             let mut tasks = store.repository.tasks.lock().unwrap();
             let mut subtitle = tasks[0].outputs[0].clone();
@@ -222,11 +235,11 @@ mod tests {
         {
             let owner = HlsPublication::begin(&store, None, &task.id).unwrap();
             store.exiting.store(true, Ordering::SeqCst);
-            owner.publish("media", 0, &root.join("work/media.tmp"), &root.join("movie.mkv")).unwrap();
+            owner.publish("media", 0, &part, &root.join("movie.mkv")).unwrap();
         }
         crate::protocol::shutdown_downloads(&store).unwrap();
         assert!(HlsPublication::begin(&store, None, &task.id).is_err());
-        let persisted: serde_json::Value = serde_json::from_slice(&fs::read(root.join("tasks.json")).unwrap()).unwrap();
+        let persisted = persisted(&root);
         assert_eq!(persisted["tasks"][0]["outputs"][0]["state"], "succeeded");
         assert_eq!(persisted["tasks"][0]["outputs"][1]["state"], "queued");
         assert_ne!(persisted["tasks"][0]["state"], "succeeded");

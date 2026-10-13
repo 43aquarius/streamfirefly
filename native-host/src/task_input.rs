@@ -452,74 +452,9 @@ pub(crate) fn unique_output_path_with(
     dir.join(format!("{}-{}.{}", stem, Uuid::new_v4(), ext))
 }
 
-/// Copies a finished work file onto its final output path. The destination is created
-/// exclusively so a file that appeared after task creation is never overwritten; a
-/// partial file from a failed copy is removed again because this call created it.
-#[cfg(test)]
-pub(crate) fn publish_task_output(
-    temporary: &Path,
-    destination: &Path,
-    tasks: &[Task],
-    self_task_id: &str,
-) -> Result<(), &'static str> {
-    publish_task_output_with(temporary, destination, tasks, self_task_id, |source, destination| {
-        std::io::copy(source, destination)?;
-        destination.sync_all()
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn publish_task_output_with(
-    temporary: &Path,
-    destination: &Path,
-    tasks: &[Task],
-    self_task_id: &str,
-    write_output: impl FnOnce(&mut fs::File, &mut fs::File) -> std::io::Result<()>,
-) -> Result<(), &'static str> {
-    let mut pending = reserve_task_output(temporary, destination, tasks, self_task_id)?;
-    if pending.write_with(write_output).is_err() {
-        let _ = pending.discard();
-        return Err("output_write_failed");
-    }
-    pending.commit();
-    Ok(())
-}
-
-pub(crate) struct PendingTaskOutput {
-    source: fs::File,
-    created: Option<fs::File>,
-    path: PathBuf,
-    committed: bool,
-}
-
-impl PendingTaskOutput {
-    pub(crate) fn write_with(&mut self, write: impl FnOnce(&mut fs::File, &mut fs::File) -> std::io::Result<()>) -> std::io::Result<()> {
-        write(&mut self.source, self.created.as_mut().expect("output reservation is active"))
-    }
-
-    pub(crate) fn commit(mut self) {
-        self.committed = true;
-    }
-
-    pub(crate) fn discard(&mut self) -> std::io::Result<()> {
-        drop(self.created.take());
-        fs::remove_file(&self.path)
-    }
-}
-
-impl Drop for PendingTaskOutput {
-    fn drop(&mut self) {
-        if !self.committed && self.created.is_some() { let _ = self.discard(); }
-    }
-}
-
-pub(crate) fn reserve_task_output(
-    temporary: &Path,
-    destination: &Path,
-    tasks: &[Task],
-    self_task_id: &str,
-) -> Result<PendingTaskOutput, &'static str> {
-    let occupied = tasks.iter().any(|task| {
+/// True when another task already owns `destination` as its primary or sidecar output.
+fn output_owned_by_other_task(destination: &Path, tasks: &[Task], self_task_id: &str) -> bool {
+    tasks.iter().any(|task| {
         task.id != self_task_id
             && (task
                 .output
@@ -533,79 +468,29 @@ pub(crate) fn reserve_task_output(
                         .map(Path::new)
                         .is_some_and(|path| paths_equivalent(path, destination))
                 }))
-    });
-    if occupied {
-        return Err("output_path_conflict");
-    }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|_| "path_not_writable")?;
-    }
-    let source = fs::File::open(temporary).map_err(|_| "output_write_failed")?;
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // Keep the path bound to this file until its durable ownership is committed.
-        options.share_mode(0x00000001);
-    }
-    let created = options
-        .open(destination)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists || destination.exists() {
-                "output_path_conflict"
-            } else { "path_not_writable" }
-        })?;
-    Ok(PendingTaskOutput { source, created: Some(created), path: destination.to_path_buf(), committed: false })
+    })
 }
 
-#[cfg(test)]
-mod publication_tests {
-    use super::*;
-    use std::io::Write;
-
-    #[cfg(windows)]
-    #[test]
-    fn pending_output_cannot_be_replaced_before_commit() {
-        let dir = std::env::temp_dir().join(format!("streamfirefly-output-ownership-{}", Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        let source = dir.join("media.tmp");
-        let destination = dir.join("movie.mkv");
-        let renamed = dir.join("renamed.mkv");
-        fs::write(&source, b"complete-media").unwrap();
-        let mut pending = reserve_task_output(&source, &destination, &[], "self").unwrap();
-        assert!(fs::rename(&destination, &renamed).is_err());
-        assert!(OpenOptions::new().write(true).open(&destination).is_err());
-        pending.write_with(|source, output| { std::io::copy(source, output)?; output.sync_all() }).unwrap();
-        pending.commit();
-        fs::rename(destination, &renamed).unwrap();
-        assert_eq!(fs::read(renamed).unwrap(), b"complete-media");
-        fs::remove_dir_all(dir).unwrap();
+/// Moves a finished work file beside the output onto its final path. The move never
+/// replaces an existing file, so anything that appeared after task creation is kept.
+pub(crate) fn publish_task_output(
+    temporary: &Path,
+    destination: &Path,
+    tasks: &[Task],
+    self_task_id: &str,
+) -> Result<(), &'static str> {
+    if output_owned_by_other_task(destination, tasks, self_task_id) {
+        return Err("output_path_conflict");
     }
-
-    #[test]
-    fn failed_copy_or_sync_removes_only_the_created_output() {
-        let dir = std::env::temp_dir().join(format!("streamfirefly-publish-failure-{}", Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        let source = dir.join("media.tmp");
-        fs::write(&source, b"complete-media").unwrap();
-        for partial in [true, false] {
-            let destination = dir.join("media.mkv");
-            let result = publish_task_output_with(&source, &destination, &[], "self", |input, output| {
-                if partial { output.write_all(b"partial")?; }
-                else { std::io::copy(input, output)?; }
-                Err(std::io::Error::other(if partial { "injected copy failure" } else { "injected sync failure" }))
-            });
-            assert_eq!(result, Err("output_write_failed"));
-            assert!(!destination.exists());
-            assert_eq!(fs::read(&source).unwrap(), b"complete-media");
+    crate::persistence::move_new_file(temporary, destination).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists || destination.exists() {
+            "output_path_conflict"
+        } else if error.kind() == std::io::ErrorKind::NotFound {
+            "output_write_failed"
+        } else {
+            "path_not_writable"
         }
-        let destination = dir.join("existing.mkv");
-        fs::write(&destination, b"original").unwrap();
-        assert_eq!(publish_task_output_with(&source, &destination, &[], "self", |_, _| panic!("must not write occupied output")), Err("output_path_conflict"));
-        assert_eq!(fs::read(destination).unwrap(), b"original");
-        fs::remove_dir_all(dir).unwrap();
-    }
+    })
 }
 
 pub(crate) fn validate_dir(value: &str) -> Result<PathBuf, &'static str> {

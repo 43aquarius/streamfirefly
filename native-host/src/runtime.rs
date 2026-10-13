@@ -10,7 +10,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::RwLock;
 
 /// True once the host began shutting down: no new children, retries or scheduled starts.
 pub(crate) fn host_exiting(store: &TaskRuntime) -> bool {
@@ -28,8 +27,6 @@ pub(crate) struct TaskRuntime {
     pub(crate) network_configured: Arc<AtomicBool>,
     pub(crate) recovery_requested: Arc<AtomicBool>,
     pub(crate) exiting: Arc<AtomicBool>,
-    pub(crate) publications: Arc<RwLock<()>>,
-    pub(crate) publication_failed: Arc<AtomicBool>,
     pub(crate) scheduler: Arc<Mutex<QueueState>>,
     pub(crate) creation: Arc<Mutex<()>>,
     pub(crate) network: Arc<Mutex<NetworkConfig>>,
@@ -47,8 +44,6 @@ pub(crate) fn load_store(path: &Path) -> TaskRuntime {
         network_configured: Arc::new(AtomicBool::new(false)),
         recovery_requested: Arc::new(AtomicBool::new(false)),
         exiting: Arc::new(AtomicBool::new(false)),
-        publications: Arc::new(RwLock::new(())),
-        publication_failed: Arc::new(AtomicBool::new(false)),
         scheduler: Arc::new(Mutex::new(QueueState::default())),
         creation: Arc::new(Mutex::new(())),
         network: Arc::new(Mutex::new(NetworkConfig::default())),

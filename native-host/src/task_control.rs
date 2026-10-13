@@ -545,6 +545,9 @@ pub(crate) fn delete_task(
     if let Some(output) = &task.output {
         let _ = fs::remove_dir_all(crate::http_download::parallel_part_dir(output, id));
     }
+    for path in task_output_paths(&task) {
+        let _ = fs::remove_file(crate::hls_publication::publish_work_path(Path::new(&path), id));
+    }
     emit(writer, json!({"version":1,"type":"task.deleted","id":id}));
     Ok(
         json!({"id": id, "fileDeleted": file_deleted, "fileKept": !delete_file && task.output.is_some()}),
