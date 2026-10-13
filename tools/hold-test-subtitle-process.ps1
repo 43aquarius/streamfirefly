@@ -60,6 +60,8 @@ try {
                 $null = $seen.Add($candidateId)
                 $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId=$candidateId" -OperationTimeoutSec 5
                 if ($processInfo.CommandLine -notmatch '\.streamfirefly-part-[^\\/"]+\.vtt') { continue }
+                # A short subtitle FFmpeg may already be exiting when suspended; hold the next one instead.
+                if ([SubtitleBarrier]::WaitForSingleObject($handle, 0) -ne 258) { continue }
                 $marker = @{ pid = $candidateId; parent = $NativePid; commandLine = $processInfo.CommandLine } | ConvertTo-Json -Compress
                 [IO.File]::WriteAllText((Join-Path $ControlDirectory 'held.json'), $marker)
                 while ([DateTime]::UtcNow -lt $deadline -and -not (Test-Path -LiteralPath $stopFile) -and
