@@ -98,7 +98,7 @@ a.button { text-decoration: none; }
 .resource-row.active { background: var(--sf-selected); box-shadow: inset 2px 0 0 var(--sf-accent); }
 .type-tile { width: 44px; height: 28px; display: grid; place-items: center; overflow: hidden; border-radius: var(--sf-radius-md); background: var(--sf-surface-3); color: var(--sf-text-2); }
 .type-tile.thumb[data-type] { background: var(--sf-media-bg); box-shadow: inset 0 0 0 1px var(--sf-border); }
-.type-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.type-tile img { width: 100%; height: 100%; object-fit: contain; display: block; }
 .type-tile[data-type="video"] { background: var(--sf-info-soft); color: var(--sf-info); }
 .type-tile[data-type="audio"] { background: var(--sf-violet-soft); color: var(--sf-violet); }
 .type-tile[data-type="image"] { background: var(--sf-warning-soft); color: var(--sf-warning); }
@@ -136,10 +136,10 @@ a.button { text-decoration: none; }
   .resource-detail-pane { flex: 1; max-width: none; min-width: 0; border-left: 0; }
 }
 .expanded-preview { position: relative; min-height: 180px; display: grid; place-items: center; overflow: hidden; border-radius: var(--sf-radius-lg); background: var(--sf-media-bg); }
-.expanded-preview video, .expanded-preview img { width: 100%; height: auto; min-height: 180px; max-height: 320px; object-fit: contain; display: block; }
+.expanded-preview video, .expanded-preview img { width: 100%; height: auto; min-height: 180px; max-height: 480px; object-fit: contain; display: block; }
 .expanded-preview audio { width: calc(100% - 24px); }
 .compact .expanded-preview, .compact .expanded-preview video, .compact .expanded-preview img { min-height: 160px; }
-.compact .expanded-preview video, .compact .expanded-preview img { max-height: 220px; }
+.compact .expanded-preview video, .compact .expanded-preview img { max-height: 360px; }
 .cover-placeholder { display: grid; justify-items: center; gap: 8px; padding: 24px; color: rgba(255, 255, 255, .6); font-size: var(--sf-text-sm); text-align: center; }
 .preview-status { position: absolute; z-index: 2; inset: 0; display: grid; place-content: center; justify-items: center; gap: 6px; color: #e7eef0; background: linear-gradient(110deg, rgba(10, 16, 18, .85), rgba(30, 44, 46, .6), rgba(10, 16, 18, .85)); background-size: 220% 100%; animation: preview-shimmer 1.5s ease-in-out infinite; }
 .preview-status i { width: 26px; height: 26px; border: 2px solid rgba(255, 255, 255, .25); border-top-color: #fff; border-radius: 50%; animation: sf-spin .8s linear infinite; }
